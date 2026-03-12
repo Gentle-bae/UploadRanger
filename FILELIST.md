@@ -3,7 +3,7 @@
 ## 项目信息
 
 - **名称**: UploadRanger
-- **版本**: v1.0.2
+- **版本**: v1.0.3
 - **作者**: bae
 - **联系**: 1073723512@qq.com
 - **描述**: 现代化文件上传漏洞测试工具
@@ -63,6 +63,7 @@
 | main_window.py                | 主窗口，包含所有界面组件 |
 | proxy_widget.py               | 代理模块                 |
 | repeater_widget.py            | Repeater重放模块         |
+| response_viewer.py            | 响应查看/渲染组件          |
 | syntax_highlighter.py         | 语法高亮模块             |
 | traffic_viewer.py             | 流量查看器               |
 
@@ -202,6 +203,12 @@ python build_exe.py --onefile
 4. 使用本工具造成的后果由使用者承担
 
 ## 更新日志
+
+### v1.0.3 (2026-03-12)
+
+- **响应查看增强**: Raw/Pretty/Render/Hex 统一展示，Hex 分列并支持按列复制
+- **稳定性**: 增加显示字节上限与截断提示，避免大响应卡顿
+- **渲染安全**: WebEngine 默认禁用 JavaScript/本地存储，减少日志刷屏
 
 ### v1.0.2 (2026-03-07)
 

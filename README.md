@@ -1,3 +1,5 @@
+![UploadRanger](img/main.png)
+
 # UploadRanger
 
 一款专业的文件上传漏洞检测工具，支持多种绕过技术检测和自动化扫描。
@@ -8,10 +10,11 @@
 
 - **智能扫描**：自动检测上传点，分析响应内容
   ![智能扫描界面](img/scan.png)
-- **代理抓包**：内置 HTTP/HTTPS 代理，支持拦  截、修改、重放
+- **代理抓包**：内置 HTTP/HTTPS 代理，支持拦 截、修改、重放
   ![代理界面](img/proxy.png)
 - **Repeater**：手动重放请求，调试绕过技术
   ![Repeater界面](img/Repeater.png)
+  ![Repeater响应界面](img/Repeater1.png)
 - **Intruder**：自动化爆破，支持多种攻击模式
   ![Intruder界面](img/Intruder.png)
 - **263+ 绕过技术**：支持各种文件类型绕过、Content-Type 绕过、WAF 绕过等
@@ -247,36 +250,3 @@ python build_exe.py
 ```bash
 python build_exe.py --clean
 ```
-
-## 更新日志
-
-### v1.0.2 (2026-03-08)
-
-- **代理修复（关键）**: 修复代理停止后无法重新启动的问题，彻底解决 `Task was destroyed but it is pending!` 警告，使用 `run_coroutine_threadsafe` 实现线程安全的任务取消
-- **配置持久化**: 新增 ConfigManager 配置管理器，代理设置自动保存和恢复
-- **过滤增强**: 代理历史记录添加过滤启用开关、300ms防抖、统计信息显示
-- **导入修复**: 修复相对导入导致的 ImportError 启动错误
-- **UI优化**: 修复 Repeater 重命名对话框宽度和绕过技术表格选中样式问题
-- **代理修复**: 修复表格选中边框覆盖URL、过滤规则匹配、停止代理清空拦截列表等问题
-- **稳定性**: 修复 QThread 崩溃问题，Windows/WSL 环境线程稳定性优化
-- **兼容性**: 修复 Linux/WSL 环境下中文乱码问题
-
-### v1.0.1 (2026-02-28)
-
-- **界面修复**: 修复扫描和流量模块中"清除"按钮字体显示不全的问题 (Issue #3)
-- **Repeater增强**: 增加标签页拖拽排序和双击重命名功能，提升交互体验 (Issue #2)
-- **代码优化**: 优化 Payload 生成器，修复 Webshell 模板缩进冗余问题 (Issue #1)
-- **稳定性提升**: 修复启动时的 NameError 警告，移除未使用的模块引用
-- **体验升级**: Payload 编辑器升级为 `QPlainTextEdit`，支持多种语言的语法高亮
-
-### v1.0.0 (2026-02-23)
-
-- 初始版本发布
-- 支持智能扫描、代理抓包、Repeater、Intruder 四大模块
-- 支持 263+ 种绕过技术
-- 基于 mitmproxy 实现 HTTPS 代理
-- 修复 asyncio event loop 与 QThread 兼容性问题
-- 修复代理停止按钮无响应问题
-- 修复放包后包仍存留问题
-- 修复历史记录响应显示问题
-- 添加详细的证书安装说明

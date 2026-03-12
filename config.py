@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 UploadRanger 配置文件
-版本: 1.0.2
+版本: 1.0.3
 作者: bae
 """
 
 # 版本信息
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 AUTHOR = "bae"
 APP_NAME = "UploadRanger"
 APP_DESCRIPTION = "文件上传漏洞测试工具"

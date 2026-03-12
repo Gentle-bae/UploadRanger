@@ -14,13 +14,20 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QGroupBox, QProgressBar, QSpinBox,
     QCheckBox, QTabWidget, QFileDialog, QMessageBox, QPlainTextEdit,
-    QApplication, QFrame, QSizePolicy
+    QApplication, QFrame, QSizePolicy, QProxyStyle, QStyle
 )
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QColor, QFont, QTextCursor
 
 from .themes.dark_theme import COLORS
 from .syntax_highlighter import HTTPHighlighter
+
+
+class _NoFocusStyle(QProxyStyle):
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PE_FrameFocusRect:
+            return
+        super().drawPrimitive(element, option, painter, widget)
 
 
 class IntruderWorker(QThread):
@@ -93,6 +100,8 @@ class IntruderWorker(QThread):
             return
         
         semaphore = asyncio.Semaphore(self.threads)
+        completed = [0]
+        lock = asyncio.Lock()
         
         async def send_request_with_limit(idx, req_data):
             async with semaphore:
@@ -102,7 +111,10 @@ class IntruderWorker(QThread):
                 result['index'] = idx
                 result['payload'] = req_data.get('payload_info', '')
                 self.result_ready.emit(result)
-                self.progress_update.emit(idx + 1, total)
+                async with lock:
+                    completed[0] += 1
+                    current = completed[0]
+                self.progress_update.emit(current, total)
         
         tasks = [send_request_with_limit(i, req) for i, req in enumerate(requests)]
         await asyncio.gather(*tasks)
@@ -653,6 +665,8 @@ class IntruderWidget(QWidget):
         
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.results_table.setStyle(_NoFocusStyle(self.results_table.style()))
         self.results_table.itemClicked.connect(self._show_result_detail)
         self.results_table.setStyleSheet(f"""
             QTableWidget {{
@@ -661,9 +675,13 @@ class IntruderWidget(QWidget):
                 border: 1px solid {COLORS['border']};
                 gridline-color: {COLORS['border']};
             }}
+            QTableWidget::item:focus {{
+                outline: 0px;
+            }}
             QTableWidget::item:selected {{
                 background-color: {COLORS['accent']};
                 color: white;
+                border: none;
             }}
             QHeaderView::section {{
                 background-color: {COLORS['bg_tertiary']};
@@ -857,6 +875,8 @@ class IntruderWidget(QWidget):
         self.detail_status.setText("")
         self.detail_length.setText("")
         self.detail_payload.setText("")
+        self.progress_bar.setMaximum(1)
+        self.progress_bar.setValue(0)
         
         base_request = {'url': url, 'method': method, 'headers': headers, 'body': body}
         
@@ -930,6 +950,7 @@ class IntruderWidget(QWidget):
     def _on_finished(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.progress_bar.setValue(self.progress_bar.maximum())
         self.status_label.setText("完成")
         self.status_label.setStyleSheet(f"color: {COLORS['success']}; font-weight: bold;")
     
