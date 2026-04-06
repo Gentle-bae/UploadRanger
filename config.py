@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 UploadRanger 配置文件
-版本: 1.0.5
+版本: 1.1.0
 作者: bae
 """
 
 # 版本信息
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 AUTHOR = "bae"
 APP_NAME = "UploadRanger"
 APP_DESCRIPTION = "文件上传漏洞测试工具"
@@ -17,9 +17,9 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_THREADS = 10
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# 扫描配置
+# 扫描配置 v2.0
 SCAN_CONFIG = {
-    'max_payloads': 200,  # 最大payload数量
+    'max_payloads': 1200,  # 最大payload数量（提升到1200）
     'max_file_size': 10 * 1024 * 1024,  # 最大文件大小 10MB
     'allowed_extensions': [
         'php', 'php3', 'php4', 'php5', 'pht', 'phtml', 'phps',

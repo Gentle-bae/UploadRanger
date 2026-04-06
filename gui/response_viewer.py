@@ -1,7 +1,8 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Response viewer: Raw / Pretty / Render / Hex."""
 
 import json
+import re
 import xml.dom.minidom
 
 try:
@@ -20,6 +21,7 @@ from PySide6.QtGui import QFont, QKeySequence, QPixmap
 from PySide6.QtCore import Qt, QUrl
 
 from .syntax_highlighter import HTTPHighlighter
+from .themes.dark_theme import COLORS
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -78,6 +80,9 @@ class ResponseViewerWidget(QWidget):
         self._init_ui()
         self._max_bytes = 2_000_000  # prevent UI freeze on huge responses
         self._max_hex_bytes = 256_000
+        # 用于 WebEngineView 刷新时存储待渲染内容
+        self._pending_html: str = ""
+        self._pending_url = QUrl("about:blank")
 
     def _detect_encoding(self, body_bytes: bytes, content_type: str = "") -> tuple:
         if not body_bytes:
@@ -122,17 +127,54 @@ class ResponseViewerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.tabs = QTabWidget()
+        # 【新增】应用暗色主题到 TabWidget
+        self.tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {COLORS['border']};
+                background-color: {COLORS['bg_secondary']};
+            }}
+            QTabBar::tab {{
+                background-color: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                padding: 8px 16px;
+                margin-right: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {COLORS['accent']};
+                color: white;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {COLORS['border']};
+            }}
+        """)
         layout.addWidget(self.tabs)
 
         self.raw_view = QPlainTextEdit()
         self.raw_view.setReadOnly(True)
         self.raw_view.setFont(QFont("Consolas", 10))
+        # 【新增】应用暗色主题到 Raw 视图 - 移除默认颜色以允许高亮器工作
+        self.raw_view.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                selection-background-color: {COLORS['accent']};
+            }}
+        """)
         self._raw_hl = HTTPHighlighter(self.raw_view.document(), is_request=False)
         self.tabs.addTab(self.raw_view, "Raw")
 
         self.pretty_view = QPlainTextEdit()
         self.pretty_view.setReadOnly(True)
         self.pretty_view.setFont(QFont("Consolas", 10))
+        # 【新增】应用暗色主题到 Pretty 视图 - 移除默认颜色以允许高亮器工作
+        self.pretty_view.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                selection-background-color: {COLORS['accent']};
+            }}
+        """)
         self._pretty_hl = HTTPHighlighter(self.pretty_view.document(), is_request=False)
         self.tabs.addTab(self.pretty_view, "Pretty")
 
@@ -141,19 +183,37 @@ class ResponseViewerWidget(QWidget):
                 self.render_view = QWebEngineView()
                 self.render_view.setPage(_SilentWebPage(self.render_view))
                 self._secure_webengine(self.render_view)
+                # 【修复】WebEngineView 背景设为与工具主题一致的深色背景
+                # 这样原始网页如果有自己的暗色背景可以正确显示
+                self.render_view.setStyleSheet(f"QWebEngineView {{ background-color: {COLORS['bg_primary']}; }}")
                 self.tabs.addTab(self.render_view, "Render")
             except Exception:
                 self.render_view = None
                 self.render_placeholder = QLabel("WebEngine unavailable")
                 self.render_placeholder.setAlignment(Qt.AlignCenter)
+                self.render_placeholder.setStyleSheet(f"""
+                    QLabel {{
+                        background-color: {COLORS['bg_secondary']};
+                        color: {COLORS['text_secondary']};
+                        padding: 20px;
+                    }}
+                """)
                 self.tabs.addTab(self.render_placeholder, "Render")
         else:
             self.render_view = None
             self.render_placeholder = QLabel("WebEngine unavailable")
             self.render_placeholder.setAlignment(Qt.AlignCenter)
+            self.render_placeholder.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {COLORS['bg_secondary']};
+                    color: {COLORS['text_secondary']};
+                    padding: 20px;
+                }}
+            """)
             self.tabs.addTab(self.render_placeholder, "Render")
 
         # ========== Image 视图 ==========
+        # 【隐藏】Image 标签对于文件上传测试通常无用，暂不显示
         self.image_scroll = QScrollArea()
         self.image_scroll.setWidgetResizable(True)
         self.image_label = QLabel()
@@ -162,7 +222,7 @@ class ResponseViewerWidget(QWidget):
         self.image_label.setText("非图片响应")
         self.image_label.setMinimumSize(400, 300)
         self.image_scroll.setWidget(self.image_label)
-        self.tabs.addTab(self.image_scroll, "Image")
+        # 【隐藏】self.tabs.addTab(self.image_scroll, "Image")
 
         self.hex_table = _HexTable()
         self.hex_table.setColumnCount(3)
@@ -177,14 +237,40 @@ class ResponseViewerWidget(QWidget):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.hex_table.setFont(QFont("Consolas", 10))
         self.hex_table.setStyle(_NoFocusStyle(self.hex_table.style()))
-        self.hex_table.setStyleSheet("QTableWidget::item:focus { outline: 0px; }")
+        # 【新增】应用暗色主题到 Hex 表格
+        self.hex_table.setStyleSheet(f"""
+            QTableWidget {{
+                background-color: {COLORS['bg_secondary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                gridline-color: {COLORS['border']};
+                selection-background-color: {COLORS['accent']};
+            }}
+            QTableWidget::item:focus {{
+                outline: 0px;
+            }}
+            QTableWidget::item:selected {{
+                background-color: {COLORS['accent']};
+                color: white;
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                padding: 8px;
+                border: none;
+                border-right: 1px solid {COLORS['border']};
+                font-weight: bold;
+            }}
+        """)
         self.tabs.addTab(self.hex_table, "Hex")
 
     def _secure_webengine(self, view: QWebEngineView):
         if view is None:
             return
         settings = view.settings()
-        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
+        # 【修复】启用 JavaScript 以支持现代网页的 CSS 样式（包括暗色主题）
+        # 由于 setHtml() 加载的是内联 HTML，安全性不受影响
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False)
@@ -241,6 +327,9 @@ class ResponseViewerWidget(QWidget):
             full_raw = f"{headers_text}\n\n{body_text}"
 
         self.raw_view.setPlainText(full_raw)
+        # 【新增】强制重新应用语法高亮
+        if hasattr(self, '_raw_hl') and self._raw_hl:
+            self._raw_hl.rehighlight()
 
         if not is_binary:
             try:
@@ -250,6 +339,9 @@ class ResponseViewerWidget(QWidget):
             if truncated:
                 pretty = f"[truncated to {self._max_bytes} bytes for display]\n\n{pretty}"
             self.pretty_view.setPlainText(pretty)
+            # 【新增】强制重新应用语法高亮
+            if hasattr(self, '_pretty_hl') and self._pretty_hl:
+                self._pretty_hl.rehighlight()
         else:
             self.pretty_view.setPlainText("[binary content]")
 
@@ -269,15 +361,29 @@ class ResponseViewerWidget(QWidget):
                     is_html_content = any(tag in body_lower for tag in html_tags)
                 
                 if is_html_content and not is_binary:
-                    # 【修复】确保HTML有基础结构
+                    # 确保HTML有基础结构（不覆盖原始样式）
                     html_to_render = self._ensure_html_structure(body_text)
                     url = QUrl(base_url) if base_url else QUrl("about:blank")
+                    # 【修复】使用 update() 强制刷新，并存储待渲染内容用于手动刷新
+                    self._pending_html = html_to_render
+                    self._pending_url = url
                     self.render_view.setHtml(html_to_render, baseUrl=url)
                 else:
-                    self.render_view.setHtml("<html><body><p>Render not available for this content.</p></body></html>")
+                    # 非 HTML 内容，显示空白页面
+                    self._pending_html = ""
+                    self._pending_url = QUrl("about:blank")
+                    self.render_view.setHtml("")
             except Exception as e:
-                # 【修复】显示错误信息而不是空白
-                self.render_view.setHtml(f"<html><body><p>Render error: {str(e)}</p></body></html>")
+                # 渲染错误，显示空白
+                print(f"Render error: {e}")
+                self.render_view.setHtml("")
+        
+        # 【修复】如果 WebEngine 不可用但有 HTML 内容，尝试在下次显示时刷新
+        elif body_text and not is_binary:
+            html_tags = ['<html', '<body', '<div', '<script', '<style', '<head', '<p>', '<a ', '<img', '<form']
+            if any(tag in body_text[:1000].lower() for tag in html_tags):
+                self._pending_html = self._ensure_html_structure(body_text)
+                self._pending_url = QUrl(base_url) if base_url else QUrl("about:blank")
 
         hex_bytes = display_bytes[: self._max_hex_bytes]
         rows = self._generate_hex_rows(hex_bytes)
@@ -302,7 +408,10 @@ class ResponseViewerWidget(QWidget):
                 content_type = line.split(':', 1)[1].strip()
                 break
 
-        headers_text = f"HTTP/1.1 {status_code}\n{headers}"
+        # 【修复】格式化响应头，使用标准 HTTP 响应格式
+        # HTTPHighlighter 可以高亮状态码 \b\d{3}\b
+        status_text = self._get_status_text(status_code)
+        headers_text = f"HTTP/1.1 {status_code} {status_text}\n{headers}"
         
         # 如果有分析结果，添加到Raw视图顶部
         if analysis:
@@ -311,6 +420,27 @@ class ResponseViewerWidget(QWidget):
                 headers_text = f"{analysis_info}\n{'='*60}\n{headers_text}"
         
         self.set_response(headers_text, body_bytes, content_type, base_url=url)
+    
+    def _get_status_text(self, status_code: int) -> str:
+        """获取状态码对应的文本描述"""
+        status_map = {
+            200: "OK",
+            201: "Created",
+            204: "No Content",
+            301: "Moved Permanently",
+            302: "Found",
+            304: "Not Modified",
+            400: "Bad Request",
+            401: "Unauthorized",
+            403: "Forbidden",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            413: "Payload Too Large",
+            500: "Internal Server Error",
+            502: "Bad Gateway",
+            503: "Service Unavailable",
+        }
+        return status_map.get(status_code, "")
     
     def _format_analysis_info(self, analysis: dict) -> str:
         """格式化分析结果信息"""
@@ -410,23 +540,60 @@ class ResponseViewerWidget(QWidget):
             self.hex_table.setItem(row, 2, QTableWidgetItem(""))
 
     def _ensure_html_structure(self, html: str) -> str:
-        """【新增】确保HTML内容有完整的基础结构"""
+        """确保HTML内容有完整的基础结构，完整保留原始样式"""
         html = html.strip()
         if not html:
-            return "<html><body></body></html>"
+            return """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body></body>
+</html>"""
         
-        # 如果已经有完整的HTML结构，直接返回
+        # 如果已经有完整的HTML结构，直接返回（完整保留原始样式）
         if html.lower().startswith('<!doctype'):
             return html
         if html.lower().startswith('<html'):
+            # 如果有 <html> 标签但不完整，尝试提取 body 内容并重新包装
+            if '</html>' not in html.lower():
+                # 尝试提取 body 内容
+                body_match = re.search(r'<body[^>]*>(.*?)</body>', html, re.DOTALL | re.IGNORECASE)
+                if body_match:
+                    body_content = body_match.group(1)
+                    return self._ensure_html_structure(body_content)
             return html
         
-        # 缺少基础结构，添加<html><body>包装
-        # 保留原有的meta charset以避免乱码
-        has_charset = 'charset' in html.lower()
-        head = '<head><meta charset="UTF-8"></head>' if not has_charset else ''
+        # 片段内容，添加最小结构包装（不添加任何额外样式，保持原始内容完整）
+        # 确保有 meta charset 以避免乱码
+        if 'charset' not in html.lower() and 'content-type' not in html.lower():
+            head = '<head><meta charset="UTF-8"></head>'
+        else:
+            head = '<head></head>'
         
-        return f"<!DOCTYPE html><html>{head}<body>{html}</body></html>"
+        return f"""<!DOCTYPE html>
+<html>
+{head}
+<body>
+{html}
+</body>
+</html>"""
+
+    def _update_render_view(self):
+        """手动刷新 Render 视图 - 用于处理嵌套 Tab 中的 WebEngineView 刷新问题"""
+        if not WEBENGINE_AVAILABLE or not self.render_view:
+            return
+        
+        try:
+            # 强制刷新 WebEngineView
+            if hasattr(self, '_pending_html'):
+                html = self._pending_html
+                base_url = self._pending_url
+                self.render_view.setHtml(html, baseUrl=base_url)
+                self._pending_html = None
+                self._pending_url = None
+        except Exception:
+            pass
 
     def _load_image(self, body_bytes: bytes, content_type: str, truncated: bool = False):
         """加载图片马等 Polyglot 载荷"""
@@ -491,8 +658,18 @@ class ResponseViewerWidget(QWidget):
             self.image_label.setPixmap(QPixmap())
 
     def clear(self):
+        """【修复】安全清空所有视图，避免程序退出时卡住"""
         self.raw_view.clear()
         self.pretty_view.clear()
+        
+        # 【修复】WebEngine 在程序退出时可能已被销毁，添加异常保护
         if self.render_view and WEBENGINE_AVAILABLE:
-            self.render_view.setHtml("")
+            try:
+                # 检查 render_view 是否还有有效的底层对象
+                if self.render_view.isVisible():
+                    self.render_view.setHtml("")
+            except Exception:
+                # 忽略退出时的异常
+                pass
+                
         self.hex_table.setRowCount(0)

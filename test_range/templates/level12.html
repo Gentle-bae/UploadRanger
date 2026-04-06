@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Level 12 - 路径泄露 | UploadRanger{% endblock %}
+{% block content %}
+<div class="nav"><a href="/">← 返回首页</a></div>
+<div class="card">
+    <h2>Level 12: 文件重命名 + 路径泄露</h2>
+    <span class="difficulty easy">简单</span>
+    <div class="info-box">
+        <h4>关卡说明</h4>
+        <p>服务端将上传文件重命名为随机 UUID，看起来攻击者无法猜到文件路径。</p>
+        <p>但 JSON 响应直接返回了 <code>url</code> 字段，泄露了完整访问路径。</p>
+    </div>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for category, message in messages %}
+            <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}{% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data" class="upload-form" id="uploadForm">
+        <div class="form-group">
+            <label for="file">选择文件:</label>
+            <input type="file" name="file" id="file" required>
+        </div>
+        <button type="submit" class="btn">上传文件</button>
+    </form>
+    <div id="result" style="margin-top:1rem;display:none;">
+        <h4>服务器响应（包含路径泄露）：</h4>
+        <pre id="jsonOutput" style="background:#1a1a2e;padding:1rem;border-radius:4px;color:#e8e8e8;overflow:auto;"></pre>
+    </div>
+</div>
+<div class="card">
+    <h3>防御方案</h3>
+    <ul>
+        <li>JSON 响应不返回文件路径，仅返回文件 ID</li>
+        <li>通过鉴权接口下载文件（如 <code>/api/files/{id}/download</code>），不暴露真实路径</li>
+        <li>上传目录设置为不可直接访问，需经过程序层鉴权</li>
+    </ul>
+</div>
+<script>
+document.getElementById('uploadForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const fd = new FormData(this);
+    const resp = await fetch('/level12', {method: 'POST', body: fd});
+    const json = await resp.json();
+    document.getElementById('jsonOutput').textContent = JSON.stringify(json, null, 2);
+    document.getElementById('result').style.display = 'block';
+});
+</script>
+{% endblock %}

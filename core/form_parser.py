@@ -5,6 +5,8 @@
 """
 
 import re
+from typing import Any, Dict, List, Set, Tuple
+
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -184,3 +186,131 @@ class FormParser:
         if form:
             return self._extract_form_info(form, url)
         return None
+
+    @staticmethod
+    def find_upload_api_candidates(html_content: str, base_url: str) -> List[Dict[str, Any]]:
+        """
+        从内联 <script> 中启发式提取可能是上传接口的 URL（fetch/axios/.post 等）。
+        不含完整 JS 语义分析，仅作辅助发现。
+        """
+        if not html_content or not base_url:
+            return []
+
+        soup = BeautifulSoup(html_content, "html.parser")
+        chunks: List[str] = []
+        for sc in soup.find_all("script"):
+            if sc.string:
+                chunks.append(sc.string)
+        text = "\n".join(chunks)
+        if not text.strip():
+            return []
+
+        patterns: List[Tuple[str, str]] = [
+            (r"fetch\s*\(\s*[`\"']([^`\"']+)[`\"']", "fetch"),
+            (r"axios\.(?:post|put)\s*\(\s*[`\"']([^`\"']+)[`\"']", "axios"),
+            (r"axios\s*\.\s*request\s*\(\s*\{[^}]*url\s*:\s*[`\"']([^`\"']+)[`\"']", "axios.request"),
+            (r"\$\.(?:post|ajax)\s*\(\s*[`\"']([^`\"']+)[`\"']", "jquery"),
+            (r"\.post\s*\(\s*[`\"']([^`\"']+)[`\"']", ".post"),
+            (r"\.put\s*\(\s*[`\"']([^`\"']+)[`\"']", ".put"),
+        ]
+
+        keywords = (
+            "upload",
+            "file",
+            "avatar",
+            "image",
+            "media",
+            "attach",
+            "multipart",
+            "import",
+            "/api/",
+        )
+
+        seen: Set[str] = set()
+        out: List[Dict[str, Any]] = []
+
+        for pat, src in patterns:
+            for m in re.finditer(pat, text, re.I | re.DOTALL):
+                path = (m.group(1) or "").strip()
+                if not path or len(path) > 800:
+                    continue
+                if path.startswith("data:") or path.startswith("#"):
+                    continue
+                low = path.lower()
+                if not any(k in low for k in keywords):
+                    continue
+                if path.startswith("http://") or path.startswith("https://"):
+                    abs_u = path.split("?")[0]
+                else:
+                    abs_u = urljoin(base_url, path.split("?")[0])
+                key = abs_u.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    {
+                        "action_url": abs_u,
+                        "method": "POST",
+                        "file_field": "file",
+                        "confidence": 0.55,
+                        "source": src,
+                    }
+                )
+                if len(out) >= 40:
+                    return out
+        return out
+
+    @staticmethod
+    def collect_upload_hints(base_url: str, html_content: str) -> List[Dict[str, Any]]:
+        """合并 HTML 上传表单与 JS 推测 API，供 GUI「发现上传点」使用。"""
+
+        class _UnusedClient:
+            def get(self, *a, **kw):
+                raise RuntimeError("collect_upload_hints 仅使用已提供的 html")
+
+        parser = FormParser(_UnusedClient())
+        items: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        try:
+            upload_forms = parser.find_upload_forms(base_url, html_content)
+        except Exception:
+            upload_forms = []
+
+        for form in upload_forms:
+            action = form.get("action") or base_url
+            method = (form.get("method") or "POST").upper()
+            for ff in form.get("file_fields") or []:
+                name = (ff.get("name") or "file").strip() or "file"
+                key = ("form", action, name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(
+                    {
+                        "label": f"[HTML表单] {method} {action}  file字段={name}",
+                        "url": action,
+                        "file_field": name,
+                        "method": method,
+                        "kind": "form",
+                    }
+                )
+
+        for api in FormParser.find_upload_api_candidates(html_content, base_url):
+            u = api["action_url"]
+            name = api.get("file_field") or "file"
+            key = ("api", u, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(
+                {
+                    "label": f"[JS推测] {api.get('method', 'POST')} {u}  字段≈{name}",
+                    "url": u,
+                    "file_field": name,
+                    "method": api.get("method", "POST"),
+                    "kind": "api",
+                }
+            )
+
+        return items

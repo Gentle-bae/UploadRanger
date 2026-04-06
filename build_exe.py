@@ -155,6 +155,15 @@ def build_exe():
         '--hidden-import', 'PIL',
         '--hidden-import', 'lxml',
         '--hidden-import', 'urllib3',
+        '--hidden-import', 'asyncio',
+        '--hidden-import', 'aiohttp',
+        '--hidden-import', 'mitmproxy',
+        '--hidden-import', 'mitmproxy.http',
+        '--hidden-import', 'mitmproxy.net',
+        '--hidden-import', 'mitmproxy.tls',
+        '--hidden-import', 'mitmproxy.websocket',
+        '--hidden-import', 'pyparsing',
+        '--hidden-import', 'blinker',
     ])
     
     # 排除冲突的Qt包
@@ -189,26 +198,6 @@ def build_exe():
     
     # 主脚本
     cmd.append('main.py')
-    
-    print("\n开始构建...")
-    print(" ".join(cmd))
-    print()
-    
-    try:
-        subprocess.check_call(cmd)
-        print("\n" + "=" * 50)
-        print("[OK] 构建成功!")
-        print("=" * 50)
-        print(f"\nEXE文件位置: {os.path.abspath('dist/UploadRanger.exe')}")
-        print("\n注意: 运行EXE需要以下文件在同一目录:")
-        print("  - payloads/ 目录")
-        print("  - core/ 目录")
-        print("  - gui/ 目录")
-        print("  - config.py")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"\n[!] 构建失败: {e}")
-        return False
 
 def build_directory():
     """构建目录版本（推荐）"""
@@ -267,6 +256,15 @@ def build_directory():
         '--hidden-import', 'PIL',
         '--hidden-import', 'lxml',
         '--hidden-import', 'urllib3',
+        '--hidden-import', 'asyncio',
+        '--hidden-import', 'aiohttp',
+        '--hidden-import', 'mitmproxy',
+        '--hidden-import', 'mitmproxy.http',
+        '--hidden-import', 'mitmproxy.net',
+        '--hidden-import', 'mitmproxy.tls',
+        '--hidden-import', 'mitmproxy.websocket',
+        '--hidden-import', 'pyparsing',
+        '--hidden-import', 'blinker',
     ])
     
     # 排除冲突的Qt包

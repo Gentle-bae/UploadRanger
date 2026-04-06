@@ -13,7 +13,8 @@
     
     <div class="info-box">
         <h4>关卡说明</h4>
-        <p>这个关卡检查文件名中是否包含.php，尝试使用双扩展名绕过！</p>
+        <p>这个关卡只检查文件末尾是否为.php，尝试使用双扩展名绕过！</p>
+        <p>提示: <code>shell.php.jpg</code> 末尾是 <code>.jpg</code>，可以通过检查</p>
     </div>
     
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -26,7 +27,7 @@
     
     <form method="post" enctype="multipart/form-data" class="upload-form">
         <div class="form-group">
-            <label for="file">选择文件 (文件名不能包含.php):</label>
+            <label for="file">选择文件 (文件名末尾不能是.php):</label>
             <input type="file" name="file" id="file" required>
         </div>
         <button type="submit" class="btn">上传文件</button>
@@ -36,10 +37,9 @@
 <div class="card">
     <h3>💡 提示</h3>
     <ul>
-        <li>双扩展名: <code>shell.php.jpg</code></li>
-        <li>某些服务器从右向左解析扩展名</li>
-        <li>Apache可能将多个扩展名的文件交给最后一个扩展名处理</li>
-        <li>尝试: <code>shell.jpg.php</code></li>
+        <li>绕过方式: <code>shell.php.jpg</code> (末尾是.jpg，通过检查)</li>
+        <li>其他可尝试: <code>shell.php.png</code>, <code>test.php.gif</code></li>
+        <li>某些服务器配置错误时会将 <code>.php.jpg</code> 当作 PHP 执行</li>
     </ul>
 </div>
 {% endblock %}

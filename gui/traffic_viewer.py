@@ -8,13 +8,16 @@
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
     QTableWidgetItem, QSplitter, QLabel, 
-    QHeaderView, QPushButton, QMenu, QPlainTextEdit, QApplication
+    QHeaderView, QPushButton, QMenu, QPlainTextEdit, QApplication, QTabWidget
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QAction, QTextCursor
 
 from .themes.dark_theme import COLORS
 from .syntax_highlighter import HTTPHighlighter
+
+# 成功状态背景色常量
+SUCCESS_BG_COLOR = "#1a3d1a"  # 深绿色背景
 
 
 class CodeEditor(QPlainTextEdit):
@@ -74,11 +77,30 @@ class TrafficViewer(QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(5)
         
-        # 标题和清除按钮
+        # 标题和按钮
         header_layout = QHBoxLayout()
         header_label = QLabel("请求历史")
         header_label.setStyleSheet(f"font-weight: bold; color: {COLORS['accent']};")
         header_layout.addWidget(header_label)
+        
+        # 【新增】跳转到成功项按钮
+        jump_success_btn = QPushButton("跳转到成功项")
+        jump_success_btn.setFixedWidth(100)
+        jump_success_btn.setToolTip("自动跳转到下一个成功的请求")
+        jump_success_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: #45a049;
+            }}
+        """)
+        jump_success_btn.clicked.connect(self._jump_to_success)
+        header_layout.addWidget(jump_success_btn)
         
         clear_btn = QPushButton("清除")
         clear_btn.setFixedWidth(80)
@@ -108,6 +130,9 @@ class TrafficViewer(QWidget):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)  # 【修复】禁用编辑
         self.table.itemClicked.connect(self.display_details)
         self.table.setAlternatingRowColors(True)
+        
+        # 【修复】隐藏垂直行号（避免与ID列重复显示）
+        self.table.verticalHeader().setVisible(False)
         
         # 右键菜单
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -230,10 +255,10 @@ class TrafficViewer(QWidget):
         
         res_layout.addLayout(res_header)
         
-        # 使用带语法高亮的编辑器
-        self.res_text = CodeEditor(is_request=False)
-        self.res_text.setReadOnly(True)
-        res_layout.addWidget(self.res_text)
+        # 使用 ResponseViewerWidget 替代 CodeEditor
+        from .response_viewer import ResponseViewerWidget
+        self.res_viewer = ResponseViewerWidget()
+        res_layout.addWidget(self.res_viewer)
         
         vertical_splitter.addWidget(res_widget)
         
@@ -274,12 +299,22 @@ class TrafficViewer(QWidget):
     def _send_to_repeater(self):
         """发送到Repeater"""
         if self.current_log:
-            self.send_to_repeater.emit(self.current_log.to_dict())
+            # 使用 to_dict 方法获取完整请求数据
+            request_data = self.current_log.to_dict()
+            # 确保有 request_body 字段
+            if 'request_body' not in request_data:
+                request_data['request_body'] = getattr(self.current_log, 'request_body', '')
+            self.send_to_repeater.emit(request_data)
     
     def _send_to_intruder(self):
         """发送到Intruder"""
         if self.current_log:
-            self.send_to_intruder.emit(self.current_log.to_dict())
+            # 使用 to_dict 方法获取完整请求数据
+            request_data = self.current_log.to_dict()
+            # 确保有 request_body 字段
+            if 'request_body' not in request_data:
+                request_data['request_body'] = getattr(self.current_log, 'request_body', '')
+            self.send_to_intruder.emit(request_data)
     
     def _copy_url(self):
         """复制URL"""
@@ -292,7 +327,7 @@ class TrafficViewer(QWidget):
         self.logs = []
         self.table.setRowCount(0)
         self.req_text.clear()
-        self.res_text.clear()
+        self.res_viewer.clear()
         self.current_log = None
         self.repeater_btn.setEnabled(False)
         self.intruder_btn.setEnabled(False)
@@ -304,21 +339,25 @@ class TrafficViewer(QWidget):
         row = self.table.rowCount()
         self.table.insertRow(row)
         
-        # ID
-        self.table.setItem(row, 0, QTableWidgetItem(str(log.id)))
+        # 【修复】提前获取状态，用于后续颜色设置
+        has_success_analysis = getattr(log, 'is_success', False)
+        
+        # ID - 使用唯一的ID而不是行号
+        id_item = QTableWidgetItem(str(log.id))
+        id_item.setData(Qt.UserRole, log)  # 存储整个log对象
         # 时间
-        self.table.setItem(row, 1, QTableWidgetItem(log.timestamp))
+        time_item = QTableWidgetItem(log.timestamp)
         # 方法
         method_item = QTableWidgetItem(log.method)
-        self.table.setItem(row, 2, method_item)
-        # URL
+        # URL - 【修复】根据 is_success 状态设置醒目前景色
         url_item = QTableWidgetItem(log.url)
         url_item.setToolTip(log.url)
-        self.table.setItem(row, 3, url_item)
+        if has_success_analysis:
+            url_item.setForeground(QColor("#00ff00"))  # 成功 - 亮绿色
         # 状态码
         status_item = QTableWidgetItem(str(log.status_code))
         
-        # 根据状态码设置颜色
+        # 根据状态码和成功状态设置颜色
         if 200 <= log.status_code < 300:
             status_item.setForeground(QColor(COLORS['success']))
         elif 300 <= log.status_code < 400:
@@ -328,10 +367,44 @@ class TrafficViewer(QWidget):
         elif 500 <= log.status_code:
             status_item.setForeground(QColor("#ff6b6b"))
         
+        # 【修复】先添加所有 item，再设置背景色（参考 ResultsTable 的修复）
+        self.table.setItem(row, 0, id_item)
+        self.table.setItem(row, 1, time_item)
+        self.table.setItem(row, 2, method_item)
+        self.table.setItem(row, 3, url_item)
         self.table.setItem(row, 4, status_item)
+        
+        # 【修复】根据成功状态设置整行背景色
+        if has_success_analysis:
+            bg_color = QColor(SUCCESS_BG_COLOR)
+            for col in range(self.table.columnCount()):
+                self.table.item(row, col).setBackground(bg_color)
         
         # 滚动到最新行
         self.table.scrollToBottom()
+    
+    def update_log_success(self, log_id: int, is_success: bool):
+        """更新指定日志的成功状态和颜色（异步分析后调用）"""
+        # 找到对应的行
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, 0)
+            if id_item and int(id_item.text()) == log_id:
+                # 更新日志对象的 is_success 属性
+                if row < len(self.logs):
+                    self.logs[row].is_success = is_success
+                
+                # 更新颜色
+                if is_success:
+                    bg_color = QColor(SUCCESS_BG_COLOR)
+                    fg_color = QColor("#00ff00")  # 亮绿色
+                    for col in range(self.table.columnCount()):
+                        item = self.table.item(row, col)
+                        if item:
+                            item.setBackground(bg_color)
+                            # URL列（第3列）单独设置前景色
+                            if col == 3:
+                                item.setForeground(fg_color)
+                break
     
     def display_details(self, item):
         """显示选中请求的详情"""
@@ -343,16 +416,22 @@ class TrafficViewer(QWidget):
             self.intruder_btn.setEnabled(True)
             
             # 格式化请求 - 显示完整内容
-            req_str = f"{log.method} {log.url} HTTP/1.1\n"
+            req_str = ""
+            if not str(log.request_headers).strip().startswith(log.method):
+                req_str += f"{log.method} {log.url} HTTP/1.1\n"
             req_str += f"{log.request_headers}\n\n"
             req_str += f"{log.request_body}"
             self.req_text.setPlainText(req_str)
             
-            # 格式化响应 - 显示完整内容
-            res_str = f"HTTP/1.1 {log.status_code}\n"
-            res_str += f"{log.response_headers}\n\n"
-            res_str += f"{log.response_body}"
-            self.res_text.setPlainText(res_str)
+            # 构建响应数据字典
+            response_data = {
+                'status_code': log.status_code,
+                'headers': log.response_headers,
+                'body': log.response_body,
+                'body_bytes': log.response_body.encode('utf-8', errors='replace') if isinstance(log.response_body, str) else b'',
+                'url': log.url
+            }
+            self.res_viewer.set_response_from_dict(response_data)
             
             # 更新状态码显示
             status_text = f"状态码: {log.status_code}"
@@ -373,3 +452,54 @@ class TrafficViewer(QWidget):
             
             self.status_label.setText(status_text)
             self.status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+    
+    def jump_to_log(self, log_id: int):
+        """【新增】跳转到指定ID的流量日志"""
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, 0)
+            if id_item and int(id_item.text()) == log_id:
+                # 选中该行
+                self.table.selectRow(row)
+                # 滚动到该行
+                self.table.scrollToItem(id_item, QTableWidget.PositionAtCenter)
+                # 显示详情
+                self.display_details(id_item)
+                return True
+        return False
+    
+    def _jump_to_success(self):
+        """【新增】跳转到下一个成功的请求"""
+        if not self.logs:
+            return
+        
+        # 获取当前选中的行
+        current_row = -1
+        selected_items = self.table.selectedItems()
+        if selected_items:
+            current_row = selected_items[0].row()
+        
+        # 查找下一个成功的请求
+        start_row = current_row + 1 if current_row >= 0 else 0
+        
+        # 先查找当前位置之后的
+        for row in range(start_row, len(self.logs)):
+            log = self.logs[row]
+            if getattr(log, 'is_success', False):
+                self._select_and_display(row)
+                return
+        
+        # 如果没找到，从头开始查找（循环）
+        if current_row >= 0:
+            for row in range(0, min(start_row, len(self.logs))):
+                log = self.logs[row]
+                if getattr(log, 'is_success', False):
+                    self._select_and_display(row)
+                    return
+    
+    def _select_and_display(self, row: int):
+        """【新增】选中并显示指定行的请求详情"""
+        self.table.selectRow(row)
+        id_item = self.table.item(row, 0)
+        if id_item:
+            self.table.scrollToItem(id_item, QTableWidget.PositionAtCenter)
+            self.display_details(id_item)

@@ -108,4 +108,6 @@ python test_all.py
 - 📧 Email：1073723512@qq.com
 - GitHub Issues
 
+> 💡 **建议**: 作者平时较忙，有问题优先提交 [GitHub Issues](https://github.com/Gentle-bae/UploadRanger/issues)，便于有类似问题的师傅互相帮助，也更易得到快速响应。
+
 感谢你的贡献！🎉

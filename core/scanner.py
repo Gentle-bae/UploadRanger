@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-上传扫描器 - 核心扫描引擎
+上传扫描器 - 核心扫描引擎 v2.0
+
+改造要点：
+1. 集成 RawHTTPClient - 字节级HTTP控制
+2. 集成 SmartAnalyzer - 三级响应判定
+3. 支持 filename 编码绕过
+4. 支持自定义 boundary
+
 """
 
 import os
@@ -11,17 +18,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
 try:
-    from .http_client import HTTPClient
+    from .http_client import HTTPClient  # 保留用于兼容性
+    from .raw_http_client import RawHTTPClient, MultipartPart, FilenameEncoder
     from .form_parser import FormParser
-    from .response_analyzer import ResponseAnalyzer
+    from .response_analyzer import ResponseAnalyzer  # 保留用于兼容性
+    from .smart_analyzer import SmartResponseAnalyzer
     from ..payloads.webshells import WebShellGenerator
     from ..payloads.bypass_payloads import BypassPayloadGenerator
     from ..payloads.polyglots import PolyglotGenerator
     from ..payloads.intruder_payloads import PayloadFactory, FuzzConfig, generate_intruder_payloads
 except ImportError:
     from core.http_client import HTTPClient
+    from core.raw_http_client import RawHTTPClient, MultipartPart, FilenameEncoder
     from core.form_parser import FormParser
     from core.response_analyzer import ResponseAnalyzer
+    from core.smart_analyzer import SmartResponseAnalyzer
     from payloads.webshells import WebShellGenerator
     from payloads.bypass_payloads import BypassPayloadGenerator
     from payloads.polyglots import PolyglotGenerator
@@ -29,33 +40,68 @@ except ImportError:
 
 
 class UploadScanner:
-    """文件上传漏洞扫描器"""
+    """文件上传漏洞扫描器 v2.0"""
     
     def __init__(self, target_url, proxy=None, timeout=30, threads=5, delay=0,
-                 cookies=None, headers=None):
+                 cookies=None, headers=None, use_raw_client=True):
+        """
+        初始化扫描器
+        
+        Args:
+            target_url: 目标URL
+            proxy: 代理设置
+            timeout: 超时时间
+            threads: 线程数
+            delay: 请求延迟
+            cookies: Cookie字典
+            headers: 请求头字典
+            use_raw_client: 是否使用RawHTTPClient（推荐开启）
+        """
         self.target_url = target_url
         self.proxy = proxy
         self.timeout = timeout
         self.threads = threads
         self.delay = delay
+        self.use_raw_client = use_raw_client  # v2.0: 控制使用哪个客户端
         
         # 初始化组件
         self.http_client = HTTPClient(timeout=timeout, proxy=proxy, delay=delay)
+        
+        # v2.0: 新增 RawHTTPClient
+        if self.use_raw_client:
+            self.raw_http_client = RawHTTPClient(
+                timeout=timeout,
+                proxy=proxy,
+                delay=delay
+            )
+        
         self.form_parser = FormParser(self.http_client)
+        
+        # v2.0: 新增 SmartAnalyzer，同时保留旧的用于兼容性
         self.response_analyzer = ResponseAnalyzer()
+        self.smart_analyzer = SmartResponseAnalyzer()
+        
         self.shell_generator = WebShellGenerator()
         self.bypass_generator = BypassPayloadGenerator()
         self.polyglot_generator = PolyglotGenerator()
         
-        # 新增: Intruder Payload Factory (高级payload引擎)
+        # Intruder Payload Factory
         self.intruder_factory = PayloadFactory()
+        
+        # v2.0: Payload配置
+        self.payload_config = FuzzConfig()
+        self.payload_config.max_payloads = 1200  # 增加payload数量
         
         # 设置认证信息
         if cookies:
             self.http_client.set_cookie(cookies)
+            if self.use_raw_client:
+                self.raw_http_client.set_cookie(cookies)
         if headers:
             for key, value in headers.items():
                 self.http_client.set_header(key, value)
+                if self.use_raw_client:
+                    self.raw_http_client.set_header(key, value)
         
         # 扫描结果
         self.results = []
@@ -122,41 +168,40 @@ class UploadScanner:
         payloads = self._generate_test_payloads(test_config, form_info=form_info)
         
         total = len(payloads)
-        for i, payload in enumerate(payloads):
+        lock = threading.Lock()
+        completed = [0]
+
+        def _run_one(idx_payload):
+            idx, payload = idx_payload
             if not self.is_running:
-                break
-            
+                return None
             try:
                 self._update_progress(
-                    f"测试 {payload.get('filename', 'unknown')} ({i+1}/{total})",
-                    20 + (i / total * 70)
+                    f"测试 {payload.get('filename', 'unknown')} ({idx+1}/{total})",
+                    20 + (idx / total * 70)
                 )
-                
-                result = self._test_upload(
-                    action, file_field, payload, other_fields
-                )
-                
-                if result:
-                    results.append(result)
-                    
-                    # 检查是否成功上传
-                    if result.get("is_success") and result.get("uploaded_path"):
-                        self.stats["successful_uploads"] += 1
-                        
-                        # 如果是webshell，测试执行
-                        if test_config.get("test_webshells"):
-                            exec_result = self._test_webshell_execution(result)
-                            result["execution_test"] = exec_result
-                
-                self.stats["total_tests"] += 1
-                
+                result = self._test_upload(action, file_field, payload, other_fields)
+                with lock:
+                    self.stats["total_tests"] += 1
+                    completed[0] += 1
+                    if result:
+                        analysis = result.get("analysis", {})
+                        if analysis.get("is_success") and analysis.get("uploaded_path"):
+                            self.stats["successful_uploads"] += 1
+                            if test_config.get("test_webshells"):
+                                result["execution_test"] = self._test_webshell_execution(result)
+                return result
             except Exception as e:
-                self.stats["errors"] += 1
-                results.append({
-                    "error": str(e),
-                    "payload": payload
-                })
-        
+                with lock:
+                    self.stats["errors"] += 1
+                return {"error": str(e), "payload": payload}
+
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = executor.map(_run_one, enumerate(payloads))
+            for r in futures:
+                if r:
+                    results.append(r)
+
         return results
     
     def _generate_test_payloads(self, test_config, form_info=None):
@@ -206,9 +251,10 @@ class UploadScanner:
                 if template:
                     # 生成intruder payloads
                     intruder_payloads = self.intruder_factory.generate_payloads(template)
-                    
-                    # 【修复】增加Intruder payloads数量限制
-                    for payload_template in intruder_payloads[:500]:  # 从100增加到500
+
+                    # 使用配置的 max_payloads 上限，不再硬编码
+                    intruder_limit = self.payload_config.max_payloads
+                    for payload_template in intruder_payloads[:intruder_limit]:
                         parsed = self._parse_intruder_payload(payload_template)
                         if parsed:
                             payloads.append(parsed)
@@ -344,42 +390,84 @@ Content-Disposition: form-data; name="{field_name}"
         }
     
     def _test_upload(self, url, field_name, payload, other_fields):
-        """测试单个上传"""
+        """
+        测试单个上传 v2.0
+        
+        优先使用 RawHTTPClient 进行字节级控制
+        """
         filename = payload.get("filename", "test.txt")
         content = payload.get("content", b"")
         content_type = payload.get("content_type", "application/octet-stream")
         
-        headers = {}
+        # 处理magic bytes
         if "magic_bytes" in payload:
             content = payload["magic_bytes"] + content
         
-        response = self.http_client.upload_bytes(
-            url, field_name, content, filename,
-            data=other_fields, headers=headers, content_type=content_type
-        )
+        # v2.0: 获取额外配置
+        boundary = payload.get("boundary")
+        filename_encoding = payload.get("filename_encoding")
         
-        analysis = self.response_analyzer.analyze(response, filename)
-        
+        # v2.0: 优先使用RawHTTPClient
+        if self.use_raw_client and self.raw_http_client:
+            response = self.raw_http_client.upload_file(
+                url=url,
+                field_name=field_name,
+                filename=filename,
+                content=content,
+                content_type=content_type,
+                boundary=boundary,
+                filename_encoding=filename_encoding,
+                extra_fields=other_fields
+            )
+            # SmartAnalyzer 返回 AnalysisResult dataclass，统一转为 dict
+            ar = self.smart_analyzer.analyze(response, filename)
+            analysis = {
+                "is_success": ar.is_success,
+                "is_failure": ar.is_failure,
+                "uploaded_path": ar.uploaded_path,
+                "full_url": ar.full_url,
+                "confidence": ar.confidence,
+                "status_code": ar.status_code,
+                "evidence": ar.evidence,
+                "reasons": ar.reasons,
+                "waf_detected": ar.waf_detected,
+                "waf_names": ar.waf_names,
+                "error_messages": ar.error_messages,
+                "success_messages": ar.success_messages,
+                "suggestions": ar.suggestions,
+                "response_time": ar.response_time,
+                "content_length": ar.content_length,
+            }
+        else:
+            # 降级使用旧的HTTPClient，response_analyzer 直接返回 dict
+            response = self.http_client.upload_bytes(
+                url, field_name, content, filename,
+                data=other_fields, headers={}, content_type=content_type
+            )
+            analysis = self.response_analyzer.analyze(response, filename)
+
         result = {
             "filename": filename,
             "description": payload.get("description", ""),
             "technique": payload.get("technique", "direct"),
             "severity": payload.get("severity", "低"),
-            "analysis": analysis
+            "analysis": analysis,
+            "boundary": boundary,
+            "filename_encoding": filename_encoding
         }
-        
+
         return result
-    
+
     def _test_webshell_execution(self, upload_result):
         """测试webshell是否可执行"""
         full_url = upload_result.get("analysis", {}).get("full_url")
-        
+
         if not full_url:
             return None
-        
+
         # 尝试访问上传的文件
         response = self.http_client.get(full_url)
-        
+
         execution_test = self.response_analyzer.check_webshell_execution(response)
         
         return execution_test
@@ -471,3 +559,7 @@ Content-Disposition: form-data; name="{field_name}"
     def close(self):
         """清理资源"""
         self.http_client.close()
+        
+        # v2.0: 关闭RawHTTPClient
+        if self.use_raw_client and self.raw_http_client:
+            self.raw_http_client.close()

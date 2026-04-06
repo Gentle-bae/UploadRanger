@@ -6,7 +6,7 @@
 
 import re
 import json
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 
 class ResponseAnalyzer:
@@ -75,7 +75,8 @@ class ResponseAnalyzer:
         
         try:
             result["status_code"] = response.status_code
-            result["response_time"] = response.elapsed.total_seconds()
+            elapsed = getattr(response, 'elapsed', None) or getattr(response, 'elapsed_time', 0)
+            result["response_time"] = elapsed.total_seconds() if hasattr(elapsed, 'total_seconds') else float(elapsed or 0)
             result["content_length"] = len(response.content)
             
             content = response.text.lower()
@@ -93,6 +94,12 @@ class ResponseAnalyzer:
             # 新增: 检测隐藏的成功指示
             hidden_indicators = self._detect_hidden_indicators(original_content)
             result["hidden_indicators"] = hidden_indicators
+
+            # 提取上传路径（优先做，供后续综合判断使用）
+            uploaded_path = self._extract_upload_path(original_content, response.url)
+            if uploaded_path:
+                result["uploaded_path"] = uploaded_path
+                result["full_url"] = urljoin(response.url, uploaded_path)
             
             # 检查成功标识
             for indicator in self.success_indicators:
@@ -132,15 +139,17 @@ class ResponseAnalyzer:
                         # 无明确成功/失败信号时不默认成功，避免误报
                         result["is_success"] = False
                         result["suggestions"].append("无法确定上传结果，建议手动验证")
+            elif 300 <= response.status_code < 400:
+                # 重定向本身不代表上传成功，避免 Location 指向页面/接口导致误报
+                if result["uploaded_path"] and self._looks_like_file_resource(result["uploaded_path"]):
+                    result["is_success"] = True
+                else:
+                    result["is_success"] = False
+                    if not result["is_failure"]:
+                        result["suggestions"].append("收到重定向响应，建议跟进重定向页或手动验证")
             elif response.status_code in [403, 415, 400]:
                 result["is_failure"] = True
                 result["suggestions"].append("可能需要使用绕过技术")
-            
-            # 提取上传路径
-            uploaded_path = self._extract_upload_path(original_content, response.url)
-            if uploaded_path:
-                result["uploaded_path"] = uploaded_path
-                result["full_url"] = urljoin(response.url, uploaded_path)
             
             # 生成分析消息
             if result["is_success"] and result["uploaded_path"]:
@@ -294,7 +303,8 @@ class ResponseAnalyzer:
                 path = matches[0]
                 # 清理路径
                 path = path.strip('"\'<>')
-                return path
+                if self._looks_like_file_resource(path) and not self._same_endpoint(path, base_url):
+                    return path
         
         # 尝试从JSON响应中提取
         try:
@@ -304,11 +314,53 @@ class ResponseAnalyzer:
                         'link', 'src', 'href', 'file_path', 'file_url']
             for key in path_keys:
                 if key in data:
-                    return str(data[key])
+                    val = str(data[key])
+                    if self._looks_like_file_resource(val) and not self._same_endpoint(val, base_url):
+                        return val
         except:
             pass
         
         return None
+
+    def _looks_like_file_resource(self, value: str) -> bool:
+        v = (value or "").strip()
+        if not v:
+            return False
+        if " " in v:
+            return False
+        if v.startswith("http://") or v.startswith("https://"):
+            try:
+                p = urlparse(v).path or ""
+            except Exception:
+                p = ""
+        else:
+            p = v
+        p = p.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if not p:
+            return False
+        last = p.rsplit("/", 1)[-1]
+        if last in (".htaccess", ".user.ini", "web.config"):
+            return True
+        if "." not in last:
+            return False
+        if last.endswith("."):
+            return False
+        ext = last.rsplit(".", 1)[-1]
+        if not ext or len(ext) > 10:
+            return False
+        if re.fullmatch(r"[a-zA-Z0-9]{1,10}", ext) is None:
+            return False
+        return True
+
+    def _same_endpoint(self, a: str, b: str) -> bool:
+        try:
+            pa = urlparse(a)
+            pb = urlparse(str(b))
+            if pa.scheme and pb.scheme:
+                return (pa.scheme, pa.netloc, pa.path) == (pb.scheme, pb.netloc, pb.path)
+            return (pa.path or a) == (pb.path or str(b))
+        except Exception:
+            return False
     
     def check_webshell_execution(self, response, expected_content=None):
         """检查webshell是否可执行"""

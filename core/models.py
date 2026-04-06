@@ -21,6 +21,7 @@ class TrafficLog:
     request_body: str
     response_headers: str
     response_body: str
+    is_success: bool = False  # 【新增】是否成功上传（用于颜色渲染）
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -32,7 +33,8 @@ class TrafficLog:
             'request_headers': self.request_headers,
             'request_body': self.request_body,
             'response_headers': self.response_headers,
-            'response_body': self.response_body
+            'response_body': self.response_body,
+            'is_success': self.is_success
         }
 
 

@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主窗口 - UploadRanger GUI主界面 v1.0.5
+主窗口 - UploadRanger GUI主界面 v1.1.0
 整合upload_forge功能，添加请求/响应查看、Repeater和Intruder功能
 """
 
 import sys
 import os
 import asyncio
+import re
+import json
+import ssl
 from datetime import datetime
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+from threading import Thread
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTabWidget, QFormLayout,
     QTextEdit, QProgressBar, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QCheckBox, QSpinBox, QSplitter,
-    QFileDialog, QComboBox, QMessageBox, QPlainTextEdit
+    QFileDialog, QComboBox, QMessageBox, QPlainTextEdit, QDialog, QInputDialog,
+    QMenu,
 )
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QColor, QFont, QIcon
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QAction
 import webbrowser
 
 from .themes.dark_theme import apply_dark_theme, COLORS
@@ -27,18 +34,45 @@ from .proxy_widget import ProxyWidget
 from .repeater_widget import RepeaterWidget
 from .intruder_widget import IntruderWidget
 from .syntax_highlighter import HTTPHighlighter, WebShellHighlighter
+from .wizard_widget import QuickScanWizard
+
+# 【新增】成功状态背景色常量
+SUCCESS_BG_COLOR = "#1a3d1a"  # 深绿色背景
+VULN_BG_COLOR = "#3d1a3d"    # 深紫色背景（漏洞）
 
 # 导入核心模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import VERSION as CURRENT_VERSION
+from core.async_scanner import get_builtin_async_payload_count
 from core.async_scanner_worker import AsyncScannerWorker
+from core.form_parser import FormParser
 from payloads.webshells import WebShellGenerator
 from payloads.bypass_payloads import BypassPayloadGenerator
 from payloads.polyglots import PolyglotGenerator
 from core.models import VulnerabilityFinding, RISK_CRITICAL, RISK_HIGH, RISK_MEDIUM
 
+GITHUB_API_URL = "https://api.github.com/repos/Gentle-bae/UploadRanger/releases/latest"
+GITHUB_REPO_URL = "https://github.com/Gentle-bae/UploadRanger"
+
+
+class _UpdateCheckBridge(QObject):
+    """工作线程通过信号把结果投递回 GUI 线程（比 QTimer.singleShot 更可靠）。"""
+
+    succeeded = Signal(str, str)
+    failed = Signal(str)
+
+
+class _PageDiscoverBridge(QObject):
+    succeeded = Signal(list)
+    failed = Signal(str)
+
 
 class ResultsTable(QTableWidget):
     """扫描结果表格 - 显示所有测试结果"""
+    
+    # 信号定义 - 用于发送到Repeater/Intruder
+    send_to_repeater = Signal(dict)
+    send_to_intruder = Signal(dict)
     
     def __init__(self):
         super().__init__()
@@ -96,6 +130,10 @@ class ResultsTable(QTableWidget):
         
         # 存储所有结果
         self.results = []
+        
+        # 【新增】右键菜单
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
     
     def clear_results(self):
         """清空结果"""
@@ -108,19 +146,29 @@ class ResultsTable(QTableWidget):
         row = self.rowCount()
         self.insertRow(row)
         
-        # 文件名
+        # 提前获取状态标志（用于后续的颜色设置）
+        is_success = result.get('is_success', False)
+        is_vulnerability = result.get('is_vulnerability', False)
+        
+        # === 创建所有 item ===
+        
+        # 第0列：文件名 - 根据状态设置醒目前景色
         filename_item = QTableWidgetItem(result.get('filename', 'Unknown'))
         filename_item.setData(Qt.UserRole, result)
-        self.setItem(row, 0, filename_item)
+        if is_vulnerability:
+            filename_item.setForeground(QColor("#ffffff"))
+            font = filename_item.font()
+            font.setBold(True)
+            filename_item.setFont(font)
+        elif is_success:
+            filename_item.setForeground(QColor("#00ff00"))
         
-        # 类型
-        self.setItem(row, 1, QTableWidgetItem(result.get('payload_type', 'Unknown')))
+        # 第1列：类型
+        type_item = QTableWidgetItem(result.get('payload_type', 'Unknown'))
         
-        # 状态码
+        # 第2列：状态码
         status_code = result.get('status_code', 0)
         status_item = QTableWidgetItem(str(status_code))
-        
-        # 根据状态码设置颜色
         if 200 <= status_code < 300:
             status_item.setForeground(QColor(COLORS['success']))
         elif 300 <= status_code < 400:
@@ -130,10 +178,7 @@ class ResultsTable(QTableWidget):
         elif 500 <= status_code:
             status_item.setForeground(QColor("#ff6b6b"))
         
-        self.setItem(row, 2, status_item)
-        
-        # 状态
-        is_success = result.get('is_success', False)
+        # 第3列：状态文本
         status_text = "成功" if is_success else "失败"
         status_text_item = QTableWidgetItem(status_text)
         reasons = result.get('decision_reasons', []) or []
@@ -143,9 +188,8 @@ class ResultsTable(QTableWidget):
             status_text_item.setForeground(QColor(COLORS['success']))
         else:
             status_text_item.setForeground(QColor(COLORS['text_secondary']))
-        self.setItem(row, 3, status_text_item)
         
-        # 概率
+        # 第4列：概率
         prob = result.get('success_probability', 0)
         prob_item = QTableWidgetItem(f"{prob}%")
         if prob >= 70:
@@ -156,16 +200,76 @@ class ResultsTable(QTableWidget):
             prob_item.setForeground(QColor(COLORS['danger']))
         confidence_level = result.get('confidence_level', 'low')
         prob_item.setToolTip(f"置信度: {confidence_level}")
-        self.setItem(row, 4, prob_item)
         
-        # 路径
-        path = result.get('path_leaked', '')
+        # 第5列：路径
+        path = result.get('path_leaked') or ''
         path_item = QTableWidgetItem(path)
         path_item.setToolTip(path)
+        
+        # === 先添加所有 item 到表格 ===
+        self.setItem(row, 0, filename_item)
+        self.setItem(row, 1, type_item)
+        self.setItem(row, 2, status_item)
+        self.setItem(row, 3, status_text_item)
+        self.setItem(row, 4, prob_item)
         self.setItem(row, 5, path_item)
+        
+        # === 统一设置整行背景色（现在所有 item 都已存在） ===
+        # 【修复】禁用交替行颜色，避免覆盖我们的自定义背景色
+        self.setAlternatingRowColors(False)
+        
+        if is_vulnerability:
+            bg_color = QColor(VULN_BG_COLOR)
+            for col in range(self.columnCount()):
+                self.item(row, col).setBackground(bg_color)
+        elif is_success:
+            bg_color = QColor(SUCCESS_BG_COLOR)
+            for col in range(self.columnCount()):
+                self.item(row, col).setBackground(bg_color)
+        else:
+            # 【修复】为普通行设置默认背景色
+            for col in range(self.columnCount()):
+                self.item(row, col).setBackground(QColor(COLORS['bg_secondary']))
         
         # 滚动到最新行
         self.scrollToBottom()
+    
+    def _show_context_menu(self, position):
+        """显示右键菜单"""
+        menu = QMenu(self)
+        
+        send_repeater_action = QAction("发送到 Repeater", self)
+        send_repeater_action.triggered.connect(self._send_result_to_repeater)
+        menu.addAction(send_repeater_action)
+        
+        send_intruder_action = QAction("发送到 Intruder", self)
+        send_intruder_action.triggered.connect(self._send_result_to_intruder)
+        menu.addAction(send_intruder_action)
+        
+        menu.exec(self.viewport().mapToGlobal(position))
+    
+    def _get_selected_result(self):
+        """获取当前选中的结果"""
+        selected = self.selectedItems()
+        if not selected:
+            return None
+        row = selected[0].row()
+        item = self.item(row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.UserRole)
+    
+    def _send_result_to_repeater(self):
+        """发送结果到Repeater"""
+        result = self._get_selected_result()
+        if result:
+            self.send_to_repeater.emit(result)
+    
+    def _send_result_to_intruder(self):
+        """发送结果到Intruder"""
+        result = self._get_selected_result()
+        if result:
+            self.send_to_intruder.emit(result)
 
 
 class FindingsTable(QTableWidget):
@@ -301,9 +405,9 @@ class MainWindow(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("UploadRanger - 文件上传漏洞测试工具 v1.0.5")
-        self.resize(1600, 1000)
-        self.setMinimumSize(1400, 800)
+        self.setWindowTitle(f"UploadRanger - 文件上传漏洞测试工具 {CURRENT_VERSION}")
+        self.resize(1315, 875)
+        self.setMinimumSize(1200, 700)
         
         # 加载图标
         self._load_icon()
@@ -317,6 +421,17 @@ class MainWindow(QMainWindow):
         # 创建UI
         self._create_ui()
 
+        self._update_bridge = _UpdateCheckBridge(self)
+        self._update_bridge.succeeded.connect(self._on_update_check_succeeded)
+        self._update_bridge.failed.connect(self._on_update_check_failed)
+        self._update_watchdog = QTimer(self)
+        self._update_watchdog.setSingleShot(True)
+        self._update_watchdog.timeout.connect(self._on_update_check_timeout)
+
+        self._discover_bridge = _PageDiscoverBridge(self)
+        self._discover_bridge.succeeded.connect(self._on_discover_uploads_succeeded)
+        self._discover_bridge.failed.connect(self._on_discover_uploads_failed)
+
         # 【修复】连接关闭事件
         self.closeEvent = self._on_close_event
     
@@ -327,12 +442,75 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
     def _on_close_event(self, event):
-        """窗口关闭前停止所有后台线程"""
-        # 停止代理线程
-        if hasattr(self, 'proxy_widget') and self.proxy_widget:
-            self.proxy_widget.stop_proxy()
-
+        """窗口关闭前停止所有后台线程 - 修复卡顿问题"""
+        # 【修复】先断开标签页切换信号，避免关闭时触发不必要的回调
+        try:
+            if hasattr(self, 'tabs') and self.tabs:
+                self.tabs.currentChanged.disconnect(self._on_tab_changed)
+        except Exception:
+            pass
+        
+        self._log("正在关闭应用程序，停止所有后台线程...")
+        
+        try:
+            # 1. 停止扫描worker线程 - 【修复】强制终止事件循环
+            if hasattr(self, 'worker') and self.worker:
+                if self.worker.isRunning():
+                    self._log("正在停止扫描worker线程...")
+                    self.worker.stop()
+                    # 【修复】缩短等待时间，避免卡顿
+                    if not self.worker.wait(1000):
+                        self._log("警告: Worker线程停止超时，强制终止...")
+                        # 【关键修复】强制终止线程
+                        self.worker.terminate()
+                        self.worker.wait(500)
+                    self.worker = None
+            
+            # 2. 停止代理线程
+            if hasattr(self, 'proxy_widget') and self.proxy_widget:
+                self._log("正在停止代理线程...")
+                try:
+                    self.proxy_widget.stop_proxy()
+                except Exception:
+                    pass
+            
+            # 3. 停止Repeater和Intruder中的worker - 【修复】强制终止
+            try:
+                if hasattr(self, 'repeater') and self.repeater:
+                    for i in range(self.repeater.content_stack.count()):
+                        tab = self.repeater.content_stack.widget(i)
+                        if hasattr(tab, 'worker') and tab.worker:
+                            if tab.worker.isRunning():
+                                tab.worker.terminate()
+                                tab.worker.wait(300)
+            except Exception:
+                pass
+            
+            try:
+                if hasattr(self, 'intruder') and self.intruder:
+                    for i in range(self.intruder.content_stack.count()):
+                        tab = self.intruder.content_stack.widget(i)
+                        if hasattr(tab, 'worker') and tab.worker:
+                            if tab.worker.isRunning():
+                                tab.worker.terminate()
+                                tab.worker.wait(300)
+            except Exception:
+                pass
+            
+            # 4. 停止任何定时器
+            if hasattr(self, '_update_watchdog') and self._update_watchdog:
+                self._update_watchdog.stop()
+            
+            self._log("所有后台线程已停止")
+            
+        except Exception as e:
+            print(f"[MainWindow] 关闭时出错: {e}")
+        
+        # 【修复】接受关闭事件，强制退出
         event.accept()
+        # 【修复】强制退出应用程序
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().quit()
     
     def _create_ui(self):
         """创建UI界面"""
@@ -371,7 +549,49 @@ class MainWindow(QMainWindow):
         
         header_layout.addStretch()
         
-        # GitHub图标按钮 - 使用文本+图标样式
+        header_wiz = QPushButton("扫描向导")
+        header_wiz.setFixedHeight(32)
+        header_wiz.setToolTip("打开快速向导，填写上传 URL 与参数（与扫描页「快速向导」相同）")
+        header_wiz.setCursor(Qt.PointingHandCursor)
+        header_wiz.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 4px 12px;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['accent']};
+                color: white;
+            }}
+        """)
+        header_wiz.clicked.connect(self._open_scan_wizard)
+        header_layout.addWidget(header_wiz)
+        
+        # 检查更新按钮
+        self.check_update_btn = QPushButton("检查更新")
+        self.check_update_btn.setFixedHeight(32)
+        self.check_update_btn.setToolTip("检查GitHub最新版本")
+        self.check_update_btn.setCursor(Qt.PointingHandCursor)
+        self.check_update_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['bg_tertiary']};
+                color: {COLORS['text_primary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 4px 12px;
+            }}
+            QPushButton:hover {{
+                background-color: #4CAF50;
+                color: white;
+                border-color: #4CAF50;
+            }}
+        """)
+        self.check_update_btn.clicked.connect(self._check_for_updates)
+        header_layout.addWidget(self.check_update_btn)
+        
+        # GitHub按钮
         self.github_btn = QPushButton("GitHub")
         self.github_btn.setFixedHeight(32)
         self.github_btn.setToolTip("访问GitHub项目主页")
@@ -394,7 +614,7 @@ class MainWindow(QMainWindow):
         self.github_btn.clicked.connect(self._open_github)
         header_layout.addWidget(self.github_btn)
         
-        version = QLabel("v1.0.5")
+        version = QLabel(f"v{CURRENT_VERSION}")
         version.setStyleSheet(f"color: {COLORS['text_secondary']}; margin-right: 15px; margin-left: 10px;")
         header_layout.addWidget(version)
         
@@ -403,6 +623,257 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(author)
         
         parent_layout.addWidget(header)
+    
+    def reset_tabs(self):
+        """重置标签页 - 用于修复标签页消失问题"""
+        try:
+            # 使用安全的方式记录日志
+            reset_msg = "正在重置标签页..."
+            print(f"[UploadRanger] {reset_msg}")
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {reset_msg}")
+            
+            current_index = self.tabs.currentIndex()
+            
+            # 记录当前各个标签页的状态
+            tab_states = {}
+            for i in range(self.tabs.count()):
+                tab_text = self.tabs.tabText(i)
+                tab_widget = self.tabs.widget(i)
+                if tab_widget:
+                    tab_states[tab_text] = tab_widget
+            
+            # 清除所有标签页
+            while self.tabs.count() > 0:
+                self.tabs.removeTab(0)
+            
+            # 重新创建所有标签页
+            self._create_scan_tab()
+            self._create_traffic_tab()
+            self._create_proxy_tab()
+            self._create_repeater_tab()
+            self._create_intruder_tab()
+            self._create_payload_tab()
+            self._create_bypass_tab()
+            self._create_polyglot_tab()
+            self._create_logs_tab()
+            self._create_about_tab()
+            
+            # 恢复之前的选中状态
+            if current_index < self.tabs.count():
+                self.tabs.setCurrentIndex(current_index)
+            
+            success_msg = "标签页重置完成"
+            print(f"[UploadRanger] {success_msg}")
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {success_msg}")
+            
+        except Exception as e:
+            error_msg = f"重置标签页失败: {str(e)}"
+            print(f"[UploadRanger] {error_msg}")
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {error_msg}")
+            QMessageBox.warning(self, "重置失败", f"标签页重置失败: {str(e)}")
+    
+    def _check_for_updates(self):
+        """检查 GitHub 最新版本（工作线程仅发信号，避免界面永久停在「检查中」）。"""
+        if self.check_update_btn.text() == "检查中...":
+            return
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("检查中...")
+        self._update_watchdog.start(20000)
+
+        bridge = self._update_bridge
+        ua_ver = CURRENT_VERSION
+
+        def fetch_version():
+            err = None
+            latest_version = ""
+            download_url = GITHUB_REPO_URL
+            try:
+                req = Request(
+                    GITHUB_API_URL,
+                    headers={"User-Agent": f"UploadRanger/{ua_ver}"},
+                )
+                ctx = ssl.create_default_context()
+                with urlopen(req, timeout=12, context=ctx) as response:
+                    raw = response.read()
+                data = json.loads(raw.decode("utf-8"))
+                latest_version = (data.get("tag_name") or "").lstrip("v")
+                download_url = data.get("html_url") or GITHUB_REPO_URL
+                if not latest_version:
+                    err = "GitHub API 未返回有效 tag_name"
+            except (URLError, HTTPError, json.JSONDecodeError, OSError, ValueError) as e:
+                err = str(e)
+            except Exception as e:
+                err = str(e)
+            if err:
+                bridge.failed.emit(err)
+            else:
+                bridge.succeeded.emit(latest_version, download_url)
+
+        Thread(target=fetch_version, daemon=True).start()
+
+    def _on_update_check_succeeded(self, latest_version: str, download_url: str):
+        self._update_watchdog.stop()
+        if self.check_update_btn.text() != "检查中...":
+            return
+        self._show_update_result(latest_version, download_url)
+
+    def _on_update_check_failed(self, error_msg: str):
+        self._update_watchdog.stop()
+        if self.check_update_btn.text() != "检查中...":
+            return
+        self._show_update_error(error_msg)
+
+    def _on_update_check_timeout(self):
+        if self.check_update_btn.text() != "检查中...":
+            return
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("检查更新")
+        QMessageBox.warning(
+            self,
+            "检查更新超时",
+            "请求超过 20 秒未完成。\n请检查网络、系统代理或防火墙；若使用抓包代理，请尝试暂时关闭后再检查。",
+        )
+    
+    def _show_update_result(self, latest_version: str, download_url: str):
+        """【修复】在主线程安全显示版本更新结果"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("检查更新")
+
+        if not (latest_version or "").strip():
+            QMessageBox.warning(
+                self,
+                "检查更新",
+                "未能解析远程版本号，请到 GitHub Release 页面手动查看。",
+            )
+            return
+        
+        if self._compare_versions(latest_version, CURRENT_VERSION) > 0:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("发现新版本")
+            msg_box.setIcon(QMessageBox.Information)
+            msg_box.setText(f"当前版本: v{CURRENT_VERSION}\n最新版本: v{latest_version}")
+            msg_box.setInformativeText("是否前往GitHub下载最新版本？")
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg_box.setDefaultButton(QMessageBox.Yes)
+            if msg_box.exec() == QMessageBox.Yes:
+                webbrowser.open(download_url)
+        else:
+            QMessageBox.information(
+                self, 
+                "已是最新版本", 
+                f"当前版本 v{CURRENT_VERSION} 已是最新版本！"
+            )
+    
+    def _show_update_error(self, error_msg: str):
+        """【修复】在主线程安全显示版本更新错误"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("检查更新")
+        QMessageBox.warning(
+            self,
+            "检查更新失败",
+            f"无法检查更新:\n{error_msg}\n\n请检查网络连接后重试。"
+        )
+    
+    def _compare_versions(self, v1: str, v2: str) -> int:
+        """
+        比较两个版本号
+        返回: 1 if v1 > v2, -1 if v1 < v2, 0 if equal
+        """
+        def parse(v):
+            return [int(x) for x in re.findall(r'\d+', v)]
+        
+        v1_parts = parse(v1)
+        v2_parts = parse(v2)
+        
+        # 补齐长度
+        max_len = max(len(v1_parts), len(v2_parts))
+        v1_parts += [0] * (max_len - len(v1_parts))
+        v2_parts += [0] * (max_len - len(v2_parts))
+        
+        for p1, p2 in zip(v1_parts, v2_parts):
+            if p1 > p2:
+                return 1
+            elif p1 < p2:
+                return -1
+        return 0
+
+    def _discover_upload_endpoints(self):
+        """拉取页面 HTML，合并表单与 JS 推测的上传端点。"""
+        page_url = self.url_input.text().strip()
+        if not page_url:
+            QMessageBox.information(self, "提示", "请先填写要分析的页面 URL。")
+            return
+        self.discover_upload_btn.setEnabled(False)
+        bridge = self._discover_bridge
+
+        def work():
+            try:
+                req = Request(
+                    page_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    },
+                )
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urlopen(req, timeout=20, context=ctx) as resp:
+                    html = resp.read().decode("utf-8", errors="replace")
+                items = FormParser.collect_upload_hints(page_url, html)
+                bridge.succeeded.emit(items)
+            except Exception as e:
+                bridge.failed.emit(str(e))
+
+        Thread(target=work, daemon=True).start()
+
+    def _on_discover_uploads_succeeded(self, items: list):
+        self.discover_upload_btn.setEnabled(True)
+        if not items:
+            QMessageBox.information(
+                self,
+                "发现上传点",
+                "未找到候选上传端点。\n可尝试填写上传页、个人中心头像页或含 <input type=file> 的页面 URL。",
+            )
+            return
+        if len(items) == 1:
+            picked = items[0]
+            self.url_input.setText(picked.get("url") or "")
+            ff = (picked.get("file_field") or "file").strip()
+            if ff:
+                self.param_input.setCurrentText(ff)
+            self._log(f"[发现上传点] {picked.get('label', picked.get('url', ''))}")
+            return
+        labels = []
+        for i, it in enumerate(items):
+            lab = it.get("label") or f"候选{i}"
+            if lab in labels:
+                lab = f"{lab} ({i})"
+            labels.append(lab)
+        choice, ok = QInputDialog.getItem(
+            self,
+            "选择上传点",
+            "选择一项填入「目标 URL」与「文件参数名」:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        idx = labels.index(choice)
+        picked = items[idx]
+        self.url_input.setText(picked.get("url") or "")
+        ff = (picked.get("file_field") or "file").strip()
+        if ff:
+            self.param_input.setCurrentText(ff)
+        self._log(f"[发现上传点] {picked.get('label', '')}")
+
+    def _on_discover_uploads_failed(self, msg: str):
+        self.discover_upload_btn.setEnabled(True)
+        QMessageBox.warning(self, "发现上传点失败", msg)
     
     def _create_tabs(self, parent_layout):
         """创建标签页"""
@@ -438,6 +909,39 @@ class MainWindow(QMainWindow):
         
         # 关于标签
         self._create_about_tab()
+        
+        # 确保核心标签页可见
+        self._ensure_core_tabs_visible()
+        
+        # 连接标签页变化信号，用于调试
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+    
+    def _ensure_core_tabs_visible(self):
+        """确保核心功能标签页可见"""
+        core_tabs = ["扫描", "请求/响应", "代理", "Repeater", "Intruder"]
+        visible_tabs = []
+        
+        for i in range(self.tabs.count()):
+            tab_text = self.tabs.tabText(i)
+            visible_tabs.append(tab_text)
+        
+        missing_tabs = [tab for tab in core_tabs if tab not in visible_tabs]
+        if missing_tabs:
+            warning_msg = f"警告: 缺少标签页: {missing_tabs}"
+            print(f"[UploadRanger] {warning_msg}")
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {warning_msg}")
+    
+    def _on_tab_changed(self, index):
+        """标签页切换事件"""
+        if index >= 0:
+            tab_text = self.tabs.tabText(index)
+            # 使用安全的方式记录标签切换
+            log_msg = f"切换到标签页: {tab_text}"
+            if hasattr(self, 'log_text') and self.log_text:
+                self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {log_msg}")
+            else:
+                print(f"[UploadRanger] {log_msg}")
     
     def _create_scan_tab(self):
         """创建扫描标签页"""
@@ -458,9 +962,18 @@ class MainWindow(QMainWindow):
         target_layout = QFormLayout(target_group)
         target_layout.setSpacing(10)
         
+        url_row = QHBoxLayout()
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("http://example.com/upload.php")
-        target_layout.addRow("目标 URL:", self.url_input)
+        self.url_input.setPlaceholderText("http://example.com/upload.php 或含上传控件的页面")
+        url_row.addWidget(self.url_input, 1)
+        self.discover_upload_btn = QPushButton("发现上传点")
+        self.discover_upload_btn.setToolTip(
+            "GET 当前 URL 对应页面，解析 HTML 表单与内联 JS 中的可疑上传接口（实验性，需授权测试）"
+        )
+        self.discover_upload_btn.setCursor(Qt.PointingHandCursor)
+        self.discover_upload_btn.clicked.connect(self._discover_upload_endpoints)
+        url_row.addWidget(self.discover_upload_btn)
+        target_layout.addRow("目标 URL:", url_row)
         
         self.param_input = QComboBox()
         self.param_input.setEditable(True)
@@ -520,15 +1033,35 @@ class MainWindow(QMainWindow):
         threads_layout.addStretch()
         options_layout.addLayout(threads_layout)
         
-        # 【新增】Payload数量配置
+        _lib_n = get_builtin_async_payload_count()
         payload_layout = QHBoxLayout()
-        payload_layout.addWidget(QLabel("Payload数量:"))
+        payload_layout.addWidget(QLabel("Payload上限:"))
         self.payload_limit_spin = QSpinBox()
-        self.payload_limit_spin.setRange(10, 1000)
-        self.payload_limit_spin.setValue(200)
+        self.payload_limit_spin.setRange(10, 2000)
+        self.payload_limit_spin.setValue(min(1200, max(60, _lib_n)))
+        self.payload_limit_spin.setToolTip(
+            f"单次扫描最多发送的请求数上限。\n"
+            f"当前内置快速扫描词库约 {_lib_n} 条，实际请求数 ≤ min(本上限, 词库)；\n"
+            f"若开启「环境指纹」，过滤后可能更少。"
+        )
         payload_layout.addWidget(self.payload_limit_spin)
         payload_layout.addStretch()
         options_layout.addLayout(payload_layout)
+        self._payload_library_hint = QLabel(
+            f"（内置词库约 {_lib_n} 条，实际 ≤ min(上限, 词库)）"
+        )
+        self._payload_library_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
+        self._payload_library_hint.setWordWrap(True)
+        options_layout.addWidget(self._payload_library_hint)
+        
+        self.use_raw_upload_cb = QCheckBox("字节级 Raw 上传（推荐）")
+        self.use_raw_upload_cb.setChecked(True)
+        self.use_raw_upload_cb.setToolTip("与同步扫描器一致，multipart 由 RawHTTPClient 构造")
+        options_layout.addWidget(self.use_raw_upload_cb)
+        
+        self.use_fingerprint_cb = QCheckBox("环境指纹过滤与排序（推荐）")
+        self.use_fingerprint_cb.setChecked(True)
+        options_layout.addWidget(self.use_fingerprint_cb)
         
         left_layout.addWidget(options_group)
         
@@ -581,6 +1114,25 @@ class MainWindow(QMainWindow):
         results_label.setStyleSheet(f"font-weight: bold; color: {COLORS['accent']};")
         results_header.addWidget(results_label)
         
+        # 【新增】跳转到成功响应按钮
+        jump_success_btn = QPushButton("跳转到成功项")
+        jump_success_btn.setFixedWidth(100)
+        jump_success_btn.setToolTip("自动滚动到第一个成功的响应")
+        jump_success_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['success']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }}
+            QPushButton:hover {{
+                background-color: #45a049;
+            }}
+        """)
+        jump_success_btn.clicked.connect(self._jump_to_first_success)
+        results_header.addWidget(jump_success_btn)
+        
         clear_results_btn = QPushButton("清除")
         clear_results_btn.setFixedWidth(80)
         clear_results_btn.clicked.connect(self._clear_results)
@@ -590,6 +1142,8 @@ class MainWindow(QMainWindow):
         
         self.results_table = ResultsTable()
         self.results_table.itemClicked.connect(self._on_result_selected)
+        self.results_table.send_to_repeater.connect(self._load_to_repeater)
+        self.results_table.send_to_intruder.connect(self._load_to_intruder)
         results_layout.addWidget(self.results_table)
         
         splitter.addWidget(results_widget)
@@ -645,14 +1199,42 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.traffic_viewer, "请求/响应")
     
     def _create_repeater_tab(self):
-        """创建Repeater标签页"""
-        self.repeater = RepeaterWidget()
-        self.tabs.addTab(self.repeater, "Repeater")
+        """创建Repeater标签页 - 修复版本"""
+        try:
+            self.repeater = RepeaterWidget()
+            self.tabs.addTab(self.repeater, "Repeater")
+            # 延迟日志记录，确保不会干扰创建过程
+            QTimer.singleShot(100, lambda: self._log("已创建Repeater标签页"))
+        except Exception as e:
+            error_msg = f"创建Repeater标签页失败: {str(e)}"
+            import traceback
+            print(f"[MainWindow] {error_msg}")
+            print(f"[MainWindow] 详细错误: {traceback.format_exc()}")
+            # 创建备用空白标签页
+            fallback_widget = QWidget()
+            fallback_layout = QVBoxLayout(fallback_widget)
+            fallback_layout.addWidget(QLabel(f"Repeater模块加载失败:\n{str(e)}\n\n请检查控制台输出获取详细信息。"))
+            self.tabs.addTab(fallback_widget, "Repeater(错误)")
+            QTimer.singleShot(100, lambda: self._log(error_msg))
     
     def _create_intruder_tab(self):
-        """创建Intruder标签页"""
-        self.intruder = IntruderWidget()
-        self.tabs.addTab(self.intruder, "Intruder")
+        """创建Intruder标签页 - 修复版本"""
+        try:
+            self.intruder = IntruderWidget()
+            self.tabs.addTab(self.intruder, "Intruder")
+            # 延迟日志记录，确保不会干扰创建过程
+            QTimer.singleShot(100, lambda: self._log("已创建Intruder标签页"))
+        except Exception as e:
+            error_msg = f"创建Intruder标签页失败: {str(e)}"
+            import traceback
+            print(f"[MainWindow] {error_msg}")
+            print(f"[MainWindow] 详细错误: {traceback.format_exc()}")
+            # 创建备用空白标签页
+            fallback_widget = QWidget()
+            fallback_layout = QVBoxLayout(fallback_widget)
+            fallback_layout.addWidget(QLabel(f"Intruder模块加载失败:\n{str(e)}\n\n请检查控制台输出获取详细信息。"))
+            self.tabs.addTab(fallback_widget, "Intruder(错误)")
+            QTimer.singleShot(100, lambda: self._log(error_msg))
     
     def _create_payload_tab(self):
         """创建Payload生成器标签页"""
@@ -856,6 +1438,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(clear_btn)
         
         self.tabs.addTab(logs_tab, "日志")
+        
+        # 处理待处理的日志消息
+        if hasattr(self, '_pending_logs') and self._pending_logs:
+            for pending_message in self._pending_logs:
+                self.log_text.append(pending_message)
+            self._pending_logs.clear()
     
     def _create_about_tab(self):
         """创建关于标签页"""
@@ -873,7 +1461,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignCenter)
         container_layout.addWidget(title)
         
-        version = QLabel("版本 v1.0.5")
+        version = QLabel(f"版本 v{CURRENT_VERSION}")
         version.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 14px;")
         version.setAlignment(Qt.AlignCenter)
         container_layout.addWidget(version)
@@ -888,15 +1476,15 @@ class MainWindow(QMainWindow):
         
         features = QLabel(
             "<b>功能特性：</b><br>"
-            "• 异步扫描引擎 (基于httpx)<br>"
-            "• 请求/响应实时查看 (Burp风格，带语法高亮)<br>"
-            "• Repeater重放功能<br>"
-            "• Intruder爆破功能 (Sniper/Battering Ram/Pitchfork/Cluster Bomb)<br>"
-            "• 100+种绕过技术测试<br>"
-            "• 23+种WebShell生成<br>"
-            "• 8种Polyglot文件<br>"
-            "• 多线程并发扫描<br>"
-            "• 详细结果报告"
+            "• 异步扫描 + 可选 Raw 字节级 multipart（与同步引擎对齐）<br>"
+            "• 环境指纹预检与 Payload 策略过滤/排序（可选）<br>"
+            "• 请求/响应实时查看 (Burp 风格，带语法高亮)<br>"
+            "• Repeater 重放 / Intruder 多模式爆破<br>"
+            "• 37+ 种绕过技术测试（生成器页）<br>"
+            "• 23 种 WebShell 生成 (PHP/ASP/JSP/Python/Perl)<br>"
+            "• 8 种 Polyglot 文件<br>"
+            "• 快速向导、GitHub 检查更新<br>"
+            "• 结构化 JSON 上传响应判定与可解释原因"
         )
         features.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px; line-height: 1.8;")
         features.setAlignment(Qt.AlignCenter)
@@ -926,6 +1514,26 @@ class MainWindow(QMainWindow):
         warning.setAlignment(Qt.AlignCenter)
         container_layout.addWidget(warning)
         
+        # 添加界面重置按钮
+        reset_btn = QPushButton("重置界面")
+        reset_btn.setToolTip("如果Repeater或Intruder标签页消失，点击此按钮恢复")
+        reset_btn.setFixedWidth(120)
+        reset_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['warning']};
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['accent']};
+            }}
+        """)
+        reset_btn.clicked.connect(self.reset_tabs)
+        container_layout.addWidget(reset_btn)
+        
         layout.addWidget(container)
         
         self.tabs.addTab(about_tab, "关于")
@@ -939,9 +1547,96 @@ class MainWindow(QMainWindow):
         self.status_bar.addPermanentWidget(self.stats_label)
     
     def _log(self, message):
-        """添加日志"""
+        """添加日志 - 安全版本，处理log_text未初始化的情况"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
+        log_message = f"[{timestamp}] {message}"
+        
+        # 如果log_text已初始化，直接写入
+        if hasattr(self, 'log_text') and self.log_text:
+            self.log_text.append(log_message)
+        else:
+            # 如果log_text还未初始化，先打印到控制台
+            print(f"[UploadRanger] {log_message}")
+            # 如果后续log_text初始化了，可以尝试追加
+            if hasattr(self, '_pending_logs'):
+                self._pending_logs.append(log_message)
+            else:
+                self._pending_logs = [log_message]
+    
+    def _open_scan_wizard(self):
+        """新手快速向导：填入扫描页并切换到扫描标签"""
+        wiz = QuickScanWizard(self)
+        if wiz.exec() != QDialog.DialogCode.Accepted:
+            return
+        def _field_str(name: str, default: str = "") -> str:
+            v = wiz.field(name)
+            if v is None:
+                return default
+            return str(v).strip() or default
+
+        url = _field_str("targetUrl")
+        param = _field_str("fileParam", "file")
+        udir = _field_str("uploadDir")
+        if url:
+            self.url_input.setText(url)
+        if param:
+            self.param_input.setCurrentText(param)
+        self.upload_dir_input.setText(udir)
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "扫描":
+                self.tabs.setCurrentIndex(i)
+                break
+        # 自动开始扫描（与用户期望一致，减少一步点击）
+        QTimer.singleShot(100, self._safe_start_scan)
+    
+    def _safe_start_scan(self):
+        """安全的扫描启动方法，用于向导完成后的自动扫描 - 修复版本"""
+        try:
+            self._log("快速向导准备启动扫描...")
+            
+            # 验证必要参数
+            if not self.url_input.text().strip():
+                self._log("错误: 快速向导未提供有效的目标URL")
+                return
+                
+            # 确保UI状态正确，避免重复启动
+            if hasattr(self, 'worker') and self.worker and self.worker.isRunning():
+                self._log("扫描已在进行中，取消向导自动扫描")
+                return
+                
+            # 检查UI状态
+            if not self.start_btn.isEnabled():
+                self._log("扫描按钮不可用，可能已有扫描在进行")
+                return
+            
+            self._log("向导自动扫描启动中...")
+            self._start_scan()
+            
+        except Exception as e:
+            error_msg = f"快速向导自动扫描失败: {str(e)}"
+            self._log(error_msg)
+            QMessageBox.warning(self, "扫描失败", f"自动扫描启动失败: {str(e)}")
+        finally:
+            # 确保UI状态正确
+            QTimer.singleShot(500, self._check_ui_state)
+    
+    def _check_ui_state(self):
+        """检查并修复UI状态"""
+        try:
+            if self.worker and self.worker.isRunning():
+                # 扫描进行中，确保按钮状态正确
+                if self.start_btn.isEnabled():
+                    self.start_btn.setEnabled(False)
+                if not self.stop_btn.isEnabled():
+                    self.stop_btn.setEnabled(True)
+            else:
+                # 扫描未进行，确保按钮状态正确
+                if not self.start_btn.isEnabled() and not (self.worker and self.worker.isRunning()):
+                    self.start_btn.setEnabled(True)
+                if self.stop_btn.isEnabled() and not (self.worker and self.worker.isRunning()):
+                    self.stop_btn.setEnabled(False)
+        except Exception:
+            pass
     
     def _open_github(self):
         """打开GitHub项目主页"""
@@ -964,10 +1659,19 @@ class MainWindow(QMainWindow):
             self._log("错误: 请输入目标URL")
             return
         
+        self._log(f"=== 开始扫描准备 ===")
+        self._log(f"目标URL: {url}")
+        self._log(f"文件参数: {self.param_input.currentText().strip() or 'file'}")
+        self._log(f"Payload上限: {self.payload_limit_spin.value()}")
+        self._log(f"超时时间: {self.timeout_spin.value()}秒")
+        self._log(f"Raw上传: {'开' if self.use_raw_upload_cb.isChecked() else '关'}")
+        self._log(f"环境指纹: {'开' if self.use_fingerprint_cb.isChecked() else '关'}")
+        
         # 收集配置
         proxy = None
         if self.use_proxy_cb.isChecked():
             proxy = self.proxy_input.text().strip()
+            self._log(f"代理: {proxy}")
         
         proxy_dict = {"http://": proxy, "https://": proxy} if proxy else None
         
@@ -983,6 +1687,8 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
+        self._log("正在创建扫描工作线程...")
+        
         # 启动工作线程
         self.worker = AsyncScannerWorker(
             target_url=url,
@@ -991,26 +1697,103 @@ class MainWindow(QMainWindow):
             proxies=proxy_dict,
             headers=headers,
             cookies=self.cookie_input.text().strip() or None,
-            # 【新增】传递Payload数量限制
-            max_payloads=self.payload_limit_spin.value()
+            max_payloads=self.payload_limit_spin.value(),
+            timeout=self.timeout_spin.value(),
+            use_raw_multipart=self.use_raw_upload_cb.isChecked(),
+            use_fingerprint=self.use_fingerprint_cb.isChecked(),
         )
-        self.worker.progress.connect(self._log)
-        self.worker.finding_found.connect(self._on_finding)
-        self.worker.result_found.connect(self._on_result)
-        self.worker.traffic_log.connect(self._on_traffic)
-        self.worker.progress_update.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
+        
+        self._log("连接工作线程信号...")
+        
+        # 确保信号正确连接（使用队列连接避免线程问题）
+        from PySide6.QtCore import Qt
+        self.worker.progress.connect(self._log, type=Qt.QueuedConnection)
+        self.worker.finding_found.connect(self._on_finding, type=Qt.QueuedConnection)
+        self.worker.result_found.connect(self._on_result, type=Qt.QueuedConnection)
+        self.worker.traffic_log.connect(self._on_traffic, type=Qt.QueuedConnection)
+        self.worker.traffic_update.connect(self._on_traffic_update, type=Qt.QueuedConnection)  # 【新增】
+        self.worker.progress_update.connect(self._on_progress, type=Qt.QueuedConnection)
+        self.worker.finished.connect(self._on_finished, type=Qt.QueuedConnection)
+        
+        # 通知worker信号已连接
+        if hasattr(self.worker, 'connect_signals_safe'):
+            self.worker.connect_signals_safe()
+        
+        self._log("检查worker状态...")
+        self._log(f"worker.isRunning(): {self.worker.isRunning()}")
+        self._log(f"worker.target_url: {self.worker.target_url}")
+        self._log(f"worker.max_payloads: {self.worker.max_payloads}")
+        
+        self._log("启动工作线程...")
         self.worker.start()
+        self._log("工作线程已启动")
+        
+        # 延迟检查worker状态
+        QTimer.singleShot(1000, self._check_worker_status)
+    
+    def _check_worker_status(self):
+        """检查worker线程状态 - 增强版本"""
+        if self.worker:
+            is_running = self.worker.isRunning()
+            self._log(f"Worker状态检查 - isRunning: {is_running}")
+            
+            if not is_running:
+                self._log("警告: Worker线程似乎停止了")
+                # 检查是否异常停止
+                if hasattr(self.worker, 'isFinished') and self.worker.isFinished():
+                    self._log("Worker已完成（可能是正常完成）")
+                else:
+                    self._log("Worker异常停止")
+                    # 尝试恢复UI状态
+                    self._on_finished(None)
+            else:
+                self._log("Worker正在正常运行")
+                # 继续监控
+                QTimer.singleShot(2000, self._check_worker_status)
+        else:
+            self._log("警告: Worker线程为None")
+            # 恢复UI状态
+            self._on_finished(None)
     
     def _stop_scan(self):
-        """停止扫描"""
-        if self.worker:
-            self.worker.stop()
-            self.worker.wait()
+        """停止扫描 - 修复版本，立即响应不等待"""
+        self._log("用户请求停止扫描...")
         
-        self.start_btn.setEnabled(True)
+        # 【修复】先禁用停止按钮，防止重复点击
         self.stop_btn.setEnabled(False)
-        self.status_bar.showMessage("扫描已停止")
+        
+        try:
+            if hasattr(self, 'worker') and self.worker:
+                if self.worker.isRunning():
+                    self._log("正在停止worker线程...")
+                    self.worker.stop()
+                    
+                    # 【修复】不再等待worker线程，立即返回
+                    # worker会在后台自行结束，不影响UI响应
+                    self._log("已发送停止信号，worker将在后台停止")
+                else:
+                    self._log("Worker线程未在运行状态")
+                
+                # 【修复】立即清理worker引用，不等待
+                self.worker = None
+            else:
+                self._log("没有活动的worker线程")
+                
+        except Exception as e:
+            error_msg = f"停止扫描时出错: {str(e)}"
+            self._log(error_msg)
+            print(f"[MainWindow] {error_msg}")
+            import traceback
+            traceback.print_exc()
+            
+        finally:
+            # 【修复】统一在finally中恢复UI状态，确保无论是否出错都能恢复
+            self._log("恢复UI状态")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.status_bar.showMessage("扫描已停止")
+            self.progress_bar.setValue(0)
+            self.progress_label.setText("扫描已停止")
     
     def _on_result(self, result: dict):
         """处理扫描结果 - 实时添加到结果表格"""
@@ -1024,30 +1807,105 @@ class MainWindow(QMainWindow):
         """处理流量日志"""
         self.traffic_viewer.add_log(log)
     
+    def _on_traffic_update(self, log_id: int, is_success: bool):
+        """处理流量日志更新（is_success 状态变化）"""
+        self.traffic_viewer.update_log_success(log_id, is_success)
+    
     def _on_progress(self, percent, message):
-        """处理进度更新"""
-        self.progress_bar.setValue(percent)
-        self.progress_label.setText(message)
-        self.status_bar.showMessage(message)
+        """处理进度更新 - 增强版本"""
+        try:
+            self._log(f"进度更新: {percent}% - {message}")
+            
+            # 确保进度条有最小值显示
+            if percent == 0:
+                self.progress_bar.setValue(1)  # 显示最小进度，避免看起来卡住
+                self.progress_bar.setFormat("初始化中...")  # 显示状态文本
+            else:
+                self.progress_bar.setValue(percent)
+                self.progress_bar.setFormat(f"%p%")  # 显示百分比
+            
+            self.progress_label.setText(message)
+            self.status_bar.showMessage(message)
+            
+            # 强制UI更新，避免界面冻结
+            from PySide6.QtWidgets import QApplication
+            QApplication.instance().processEvents()
+            
+        except Exception as e:
+            print(f"进度更新异常: {e}")
+            # 降级处理，确保UI不崩溃
+            try:
+                self.progress_bar.setValue(0)
+                self.status_bar.showMessage("进度更新错误")
+            except:
+                pass
     
     def _on_finished(self, result):
-        """扫描完成"""
+        """扫描完成 - 增强版本，处理各种异常情况"""
+        self._log("=== 扫描完成处理开始 ===")
+        
+        # 确保UI状态正确恢复
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         
-        # 统计
-        result_count = len(self.results_table.results)
-        vuln_count = len(result.findings)
-        success_count = sum(1 for r in self.results_table.results if r.get('is_success'))
+        # 清理worker引用
+        if self.worker:
+            try:
+                if self.worker.isRunning():
+                    self.worker.wait(1000)  # 等待最多1秒
+                self.worker = None
+            except Exception as e:
+                self._log(f"清理worker时出错: {e}")
         
-        self.stats_label.setText(f"结果: {result_count} | 成功: {success_count} | 漏洞: {vuln_count}")
-        self.status_bar.showMessage(f"扫描完成 - 共测试 {result_count} 个payload，成功 {success_count} 个，发现 {vuln_count} 个漏洞")
+        # 处理结果统计
+        try:
+            result_count = len(self.results_table.results)
+
+            if result and hasattr(result, 'findings'):
+                vuln_count = len(result.findings)
+            else:
+                vuln_count = 0
+
+            # 【BUG-6修复】区分两种"成功"：
+            #   analyzed_success: 分析器判定成功（含分支2，可能无HTTP验证）
+            #   verified_success:  HTTP验证通过的成功（等价于 is_vulnerability）
+            analyzed_success = sum(1 for r in self.results_table.results if r.get('is_success'))
+            verified_success = sum(1 for r in self.results_table.results if r.get('is_vulnerability'))
+
+            if result_count == 0:
+                self._log("扫描完成，但没有发现任何结果")
+                self.status_bar.showMessage("扫描完成 - 未发现上传漏洞")
+            else:
+                self.status_bar.showMessage(
+                    f"扫描完成 - 共测试 {result_count} 个payload，"
+                    f"响应判定成功 {analyzed_success} 个，已验证漏洞 {verified_success} 个，"
+                    f"发现 {vuln_count} 个漏洞"
+                )
+
+            self.stats_label.setText(
+                f"结果: {result_count} | 响应成功: {analyzed_success} | 已验证: {verified_success} | 漏洞: {vuln_count}"
+            )
+            self._log(
+                f"扫描完成！共测试 {result_count} 个payload，"
+                f"响应判定成功 {analyzed_success} 个，已验证漏洞 {verified_success} 个，"
+                f"发现 {vuln_count} 个漏洞"
+            )
+            
+        except Exception as e:
+            self._log(f"处理扫描结果时出错: {e}")
+            self.status_bar.showMessage("扫描完成 - 结果处理出错")
+            self.stats_label.setText("结果: 错误")
         
-        self._log(f"扫描完成！共测试 {result_count} 个payload，成功 {success_count} 个，发现 {vuln_count} 个漏洞")
+        self._log("=== 扫描完成处理结束 ===")
     
     def _on_result_selected(self, item):
-        """结果选择事件"""
+        """结果选择事件 - 【修复】添加整行高亮和滚动定位"""
         row = item.row()
+        
+        # 【修复】选中整行并滚动到该行
+        self.results_table.selectRow(row)
+        self.results_table.scrollToItem(item, QTableWidget.PositionAtCenter)
+        
         result = self.results_table.item(row, 0).data(Qt.UserRole)
         
         if result:
@@ -1076,8 +1934,13 @@ class MainWindow(QMainWindow):
             self.details_text.setPlainText(details)
     
     def _on_finding_selected(self, item):
-        """漏洞选择事件"""
+        """漏洞选择事件 - 【修复】添加整行高亮和滚动定位"""
         row = item.row()
+        
+        # 【修复】选中整行并滚动到该行
+        self.findings_table.selectRow(row)
+        self.findings_table.scrollToItem(item, QTableWidget.PositionAtCenter)
+        
         finding = self.findings_table.item(row, 0).data(Qt.UserRole)
         
         if finding:
@@ -1106,6 +1969,67 @@ Payload: {finding.payload}
         """清除结果"""
         self.results_table.clear_results()
     
+    def _jump_to_first_success(self):
+        """【修复】跳转到成功响应项 - 支持循环跳转到下一个"""
+        if not self.results_table.results:
+            self._log("没有扫描结果")
+            return
+        
+        # 获取当前选中的行，用于确定从哪个位置开始查找
+        current_row = -1
+        selected_items = self.results_table.selectedItems()
+        if selected_items:
+            current_row = selected_items[0].row()
+        
+        # 查找下一个成功的响应（从当前选中位置之后开始）
+        found = False
+        start_row = current_row + 1 if current_row >= 0 else 0
+        
+        # 先查找当前位置之后的
+        for row in range(start_row, len(self.results_table.results)):
+            result = self.results_table.results[row]
+            if result.get('is_success', False):
+                self._select_and_jump_to_result(row, result)
+                found = True
+                return
+        
+        # 如果没找到，从头开始查找（循环）
+        if not found and current_row >= 0:
+            for row in range(0, min(start_row, len(self.results_table.results))):
+                result = self.results_table.results[row]
+                if result.get('is_success', False):
+                    self._select_and_jump_to_result(row, result)
+                    found = True
+                    return
+        
+        if not found:
+            self._log("没有找到成功的响应")
+    
+    def _select_and_jump_to_result(self, row: int, result: dict):
+        """【新增】选中结果并同步跳转到请求/响应界面"""
+        # 1. 在扫描结果表格中选中
+        self.results_table.selectRow(row)
+        item = self.results_table.item(row, 0)
+        if item:
+            self.results_table.scrollToItem(item, QTableWidget.PositionAtCenter)
+            self._on_result_selected(item)
+        
+        # 2. 【修复】同步跳转到请求/响应界面的对应数据包
+        log_id = result.get('log_id')
+        if log_id:
+            # 切换到请求/响应标签
+            for i in range(self.tabs.count()):
+                if self.tabs.tabText(i) == "请求/响应":
+                    self.tabs.setCurrentIndex(i)
+                    break
+            # 跳转到对应的流量日志
+            if self.traffic_viewer.jump_to_log(log_id):
+                self._log(f"已跳转到第 {row + 1} 个成功响应 (ID: {log_id})")
+            else:
+                self._log(f"已跳转到第 {row + 1} 个成功响应")
+        else:
+            self._log(f"已跳转到第 {row + 1} 个成功响应")
+    
     def _clear_findings(self):
         """清除漏洞发现"""
         self.findings_table.clear_results()
@@ -1120,6 +2044,14 @@ Payload: {finding.payload}
                 'url': request_data.url if request_data.url.startswith('http') else f"http://{request_data.host}{request_data.url}",
                 'request_headers': "\n".join([f"{k}: {v}" for k, v in request_data.headers.items()]),
                 'request_body': request_data.body.decode('utf-8', errors='ignore') if request_data.body else ''
+            }
+        elif 'request_body' in request_data:
+            # 扫描结果字典
+            data = {
+                'method': request_data.get('method', 'POST'),
+                'url': request_data.get('url', ''),
+                'request_headers': request_data.get('request_headers', ''),
+                'request_body': request_data.get('request_body', '')
             }
         else:
             data = request_data
@@ -1138,6 +2070,14 @@ Payload: {finding.payload}
                 'url': request_data.url if request_data.url.startswith('http') else f"http://{request_data.host}{request_data.url}",
                 'request_headers': "\n".join([f"{k}: {v}" for k, v in request_data.headers.items()]),
                 'request_body': request_data.body.decode('utf-8', errors='ignore') if request_data.body else ''
+            }
+        elif 'request_body' in request_data:
+            # 扫描结果字典
+            data = {
+                'method': request_data.get('method', 'POST'),
+                'url': request_data.get('url', ''),
+                'request_headers': request_data.get('request_headers', ''),
+                'request_body': request_data.get('request_body', '')
             }
         else:
             data = request_data
@@ -1385,6 +2325,10 @@ def run_gui():
         pass
     
     app = QApplication(sys.argv)
+    
+    # 【关键修复】防止关闭子标签时整个应用退出
+    # 当 Repeater 内部标签关闭时，Qt 可能误判为最后一个窗口关闭而触发 quit
+    app.setQuitOnLastWindowClosed(False)
     
     # 【修复】Linux/WSL环境下设置中文字体，防止乱码
     if sys.platform.startswith('linux'):

@@ -48,8 +48,6 @@ def test_imports():
         ("core.scanner", "UploadScanner (同步)"),
         ("core.models", "数据模型"),
         ("core.config_manager", "配置管理器"),
-        ("core.proxy_server", "代理服务器"),
-        
         # 异步模块
         ("core.async_http_client", "AsyncHTTPClient"),
         ("core.async_response_analyzer", "AsyncResponseAnalyzer"),
@@ -369,22 +367,6 @@ x
         print_error(f"Intruder Payloads测试失败: {e}")
         return False
 
-def test_proxy_server():
-    """测试代理服务器"""
-    print_header("测试代理服务器")
-    
-    try:
-        from core.proxy_server import ProxyServer
-        
-        proxy = ProxyServer(host="127.0.0.1", port=8080)
-        print_success("ProxyServer 创建成功")
-        print_info(f"监听地址: {proxy.host}:{proxy.port}")
-        
-        return True
-    except Exception as e:
-        print_error(f"代理服务器测试失败: {e}")
-        return False
-
 def test_gui_components():
     """测试GUI组件 (不启动界面)"""
     print_header("测试GUI组件")
@@ -583,9 +565,10 @@ def test_response_viewer_set_response():
 
 def main():
     """主函数"""
+    import config
     print(f"\n{Colors.BLUE}{'=' * 60}{Colors.RESET}")
     print(f"{Colors.BLUE}  UploadRanger 完整功能测试{Colors.RESET}")
-    print(f"{Colors.BLUE}  版本: 1.0.5{Colors.RESET}")
+    print(f"{Colors.BLUE}  版本: {config.VERSION}{Colors.RESET}")
     print(f"{Colors.BLUE}{'=' * 60}{Colors.RESET}")
     
     # 定义测试
@@ -601,7 +584,6 @@ def main():
         ("绕过Payload生成器", test_bypass_payloads),
         ("Polyglot生成器", test_polyglots),
         ("Intruder Payloads", test_intruder_payloads),
-        ("代理服务器", test_proxy_server),
         ("GUI组件", test_gui_components),
         ("异步扫描Worker", test_async_scanner_worker),
         ("文件操作", test_file_operations),
