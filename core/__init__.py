@@ -1,76 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-UploadRanger 核心包（应用版本见 config.VERSION，当前 1.1.0）- 统一导出
-
-提供对所有核心组件的统一访问：
-- RawHTTPClient: 字节级HTTP控制
-- SmartAnalyzer: 智能响应分析
-- FilenameEncoder: 文件名编码器
-- EnvironmentFingerprinter: 环境指纹识别
-
-Author: bae
+Core 模块 - UploadRanger核心功能
 """
 
-from .raw_http_client import (
-    RawHTTPClient,
-    RawHTTPResponse,
-    MultipartPart,
-    FilenameEncoder,
-    RawHTTPBuilder,
-    create_upload_request
-)
+from .async_scanner import AsyncScanner
+from .async_http_client import AsyncHTTPClient
+from .smart_analyzer import SmartResponseAnalyzer
+from .fingerprinter import EnvironmentFingerprinter, EnvironmentProfile
 
-from .smart_analyzer import (
-    SmartResponseAnalyzer,
-    AnalysisResult,
-    ScoringRule
-)
+try:
+    from .auto_verifier import WebShellVerifier, UploadPathExtractor
+    VERIFIER_AVAILABLE = True
+except ImportError:
+    VERIFIER_AVAILABLE = False
 
-from .fingerprinter import (
-    EnvironmentFingerprinter,
-    EnvironmentProfile,
-    fingerprint_environment,
-    get_recommended_payloads,
-    STRATEGY_MATRIX
-)
-
-from .oob_verifier import (
-    OOBVerifier,
-    create_verifier,
-    PLATFORM_INTERACTSH,
-    PLATFORM_CEYE,
-    PLATFORM_NONE,
-)
-
-# 版本信息
-__version__ = "1.1.0"
+try:
+    from .oob_verifier import OOBVerifier
+    OOB_AVAILABLE = True
+except ImportError:
+    OOB_AVAILABLE = False
 
 __all__ = [
-    # HTTP客户端
-    'RawHTTPClient',
-    'RawHTTPResponse', 
-    'MultipartPart',
-    'FilenameEncoder',
-    'RawHTTPBuilder',
-    'create_upload_request',
-    
-    # 分析器
+    'AsyncScanner',
+    'AsyncHTTPClient',
     'SmartResponseAnalyzer',
-    'AnalysisResult',
-    'ScoringRule',
-    
-    # 指纹识别
     'EnvironmentFingerprinter',
     'EnvironmentProfile',
-    'fingerprint_environment',
-    'get_recommended_payloads',
-    'STRATEGY_MATRIX',
-
-    # OOB 带外验证
-    'OOBVerifier',
-    'create_verifier',
-    'PLATFORM_INTERACTSH',
-    'PLATFORM_CEYE',
-    'PLATFORM_NONE',
 ]
+
+if VERIFIER_AVAILABLE:
+    __all__.extend(['WebShellVerifier', 'UploadPathExtractor'])
+
+if OOB_AVAILABLE:
+    __all__.append('OOBVerifier')

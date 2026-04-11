@@ -195,9 +195,7 @@ def build_exe():
     except subprocess.CalledProcessError as e:
         print(f"\n[!] 构建失败: {e}")
         return False
-    
-    # 主脚本
-    cmd.append('main.py')
+
 
 def build_directory():
     """构建目录版本（推荐）"""

@@ -16,7 +16,6 @@ OOB Verifier - 带外验证模块
         print(f"确认执行！OOB 命中: {hit}")
 
 Author: UploadRanger
-Version: 2.0.0
 """
 
 from __future__ import annotations

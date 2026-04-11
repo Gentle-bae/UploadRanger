@@ -42,6 +42,8 @@ QTabWidget::pane {{
     border: 1px solid {COLORS['border']};
     background-color: {COLORS['bg_secondary']};
     border-radius: 4px;
+    padding: 0px;
+    margin: 0px;
 }}
 
 QTabBar::tab {{

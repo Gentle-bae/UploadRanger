@@ -35,6 +35,9 @@ class AsyncScannerWorker(QThread):
         timeout=30,
         use_raw_multipart=True,
         use_fingerprint=True,
+        selected_extensions=None,  # 【新增】用户选择的后缀
+        scan_mode="security",  # 【新增】扫描模式: security / penetration
+        webshell_config=None,  # 【新增】WebShell配置
     ):
         super().__init__()
         self.target_url = target_url
@@ -47,6 +50,9 @@ class AsyncScannerWorker(QThread):
         self.timeout = timeout
         self.use_raw_multipart = use_raw_multipart
         self.use_fingerprint = use_fingerprint
+        self.selected_extensions = selected_extensions or [".php", ".phtml", ".php3", ".php4", ".php5", ".phar", ".asp", ".aspx", ".cer", ".cdx", ".asa", ".jsp", ".jspx", ".jspf", ".jhtml", ".pl", ".cgi", ".py"]
+        self.scan_mode = scan_mode
+        self.webshell_config = webshell_config or {"enabled": False}
         self.scanner = AsyncScanner()
         
         # 确保信号连接正常工作
@@ -60,9 +66,8 @@ class AsyncScannerWorker(QThread):
         """日志回调"""
         try:
             self.progress.emit(message)
-        except Exception as e:
-            print(f"[AsyncScannerWorker] 日志回调异常: {e}")
-            print(f"[AsyncScannerWorker] 原始消息: {message}")
+        except Exception:
+            pass
     
     def _on_traffic(self, log: TrafficLog):
         """流量日志回调"""
@@ -84,9 +89,8 @@ class AsyncScannerWorker(QThread):
         """进度回调"""
         try:
             self.progress_update.emit(percent, message)
-        except Exception as e:
-            print(f"[AsyncScannerWorker] 进度回调异常: {e}")
-            print(f"[AsyncScannerWorker] 进度信息: {percent}% - {message}")
+        except Exception:
+            pass
     
     def run(self):
         """运行扫描"""
@@ -105,25 +109,19 @@ class AsyncScannerWorker(QThread):
             
             # 【关键修复】确保scanner的running状态被重置为True
             self.scanner.running = True
-            self.progress.emit(f"扫描器状态已重置: running={self.scanner.running}")
             
-            print(f"[AsyncScannerWorker] 创建新的事件循环...")
             loop = asyncio.new_event_loop()
-            print(f"[AsyncScannerWorker] 事件循环创建成功: {type(loop).__name__}")
             
             # Windows上使用ProactorEventLoop，Linux使用SelectorEventLoop
             if sys.platform == 'win32':
-                # Windows默认就是ProactorEventLoop，不需要特别设置
                 pass
             elif sys.platform.startswith('linux'):
                 loop = asyncio.SelectorEventLoop()
             
             asyncio.set_event_loop(loop)
-            self.progress.emit(f"事件循环已创建: {type(loop).__name__}")
             
             try:
-                self.progress.emit("开始调用scanner.scan()...")
-                print(f"[AsyncScannerWorker] 开始调用scanner.scan()...")
+                self.progress.emit("开始扫描...")
                 
                 result = loop.run_until_complete(self.scanner.scan(
                     target_url=self.target_url,
@@ -142,6 +140,9 @@ class AsyncScannerWorker(QThread):
                     timeout=self.timeout,
                     use_raw_multipart=self.use_raw_multipart,
                     use_fingerprint=self.use_fingerprint,
+                    selected_extensions=self.selected_extensions,
+                    scan_mode=self.scan_mode,  # 【新增】
+                    webshell_config=self.webshell_config,  # 【新增】
                 ))
                 
                 print(f"[AsyncScannerWorker] scanner.scan()完成")

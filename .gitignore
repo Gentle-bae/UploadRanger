@@ -66,4 +66,4 @@ test_range/uploads/*
 config.local.py
 
 # 开发文档（不上传）
-UPGRADE_PROGRESS_v2.md
+#UPGRADE_PROGRESS_v2.md

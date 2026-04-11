@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主窗口 - UploadRanger GUI主界面 v1.1.0
+主窗口 - UploadRanger GUI主界面 v1.1.1
 整合upload_forge功能，添加请求/响应查看、Repeater和Intruder功能
 """
 
@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
     QTextEdit, QProgressBar, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QCheckBox, QSpinBox, QSplitter,
     QFileDialog, QComboBox, QMessageBox, QPlainTextEdit, QDialog, QInputDialog,
-    QMenu,
+    QMenu, QFrame, QScrollArea, QListWidget, QListWidgetItem,
+    QRadioButton, QButtonGroup,
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QAction
@@ -35,6 +36,9 @@ from .repeater_widget import RepeaterWidget
 from .intruder_widget import IntruderWidget
 from .syntax_highlighter import HTTPHighlighter, WebShellHighlighter
 from .wizard_widget import QuickScanWizard
+
+
+# 导入核心模块
 
 # 【新增】成功状态背景色常量
 SUCCESS_BG_COLOR = "#1a3d1a"  # 深绿色背景
@@ -67,24 +71,273 @@ class _PageDiscoverBridge(QObject):
     failed = Signal(str)
 
 
+class ExtensionSelectorDialog(QDialog):
+    """后缀选择对话框"""
+    
+    # 所有可用后缀定义
+    EXTENSION_GROUPS = {
+        "PHP": ["php", "phtml", "php3", "php4", "php5", "phar"],
+        "ASP": ["asp", "aspx", "cer", "cdx", "asa"],
+        "JSP": ["jsp", "jspx", "jspf", "jspa"],
+        "Python": ["py", "py3", "pypi"],
+        "Perl": ["pl", "pm"],
+        "CGI": ["cgi", "fcgi"],
+        "Other": ["jhtml", "shtml", "htm", "html", "svg"],
+        # 操作系统级后缀
+        "Win系统": ["exe", "dll", "bat", "cmd", "vbs", "ps1", "hta", "scr", "cpl"],
+        "Linux": ["sh", "bash", "elf", "so"],
+        # 配置文件（安全模式为纯文本）
+        "配置": ["htaccess", "user.ini", "ini"],
+        # Office文档
+        "文档": ["docm", "xlsm", "pptm", "pdf", "rtf", "csv"],
+        # 【删除】压缩包已移除（zip、rar、tar、gz、bz2、7z）
+    }
+    
+    def __init__(self, parent=None, initial_exts=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择测试后缀")
+        self.setMinimumWidth(450)
+        self.setMinimumHeight(400)
+        
+        # 默认全选
+        if initial_exts is None:
+            initial_exts = set()
+            for exts in self.EXTENSION_GROUPS.values():
+                initial_exts.update(exts)
+        
+        self.selected_exts = set(initial_exts)
+        
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 说明标签
+        info_label = QLabel("选择要测试的文件后缀。已确认成功的后缀将自动跳过。")
+        info_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        layout.addWidget(info_label)
+        
+        # 快速操作按钮
+        btn_row = QHBoxLayout()
+        select_all_btn = QPushButton("全选")
+        select_all_btn.setFixedWidth(100)  # 修复按钮显示不全
+        select_all_btn.clicked.connect(self._select_all)
+        deselect_all_btn = QPushButton("取消全选")
+        deselect_all_btn.setFixedWidth(100)  # 修复按钮显示不全
+        deselect_all_btn.clicked.connect(self._deselect_all)
+        btn_row.addWidget(select_all_btn)
+        btn_row.addWidget(deselect_all_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        
+        # 滚动区域
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # 按语言分组显示
+        self.group_widgets = {}
+        for group_name, exts in self.EXTENSION_GROUPS.items():
+            group_box = QGroupBox(group_name)
+            group_layout = QVBoxLayout(group_box)
+            
+            # 全选/反选按钮
+            header_row = QHBoxLayout()
+            group_select_all = QPushButton("全选")
+            group_select_all.setFixedWidth(80)  # 修复按钮显示不全
+            group_select_all.clicked.connect(lambda checked, g=group_name: self._group_select(g))
+            header_row.addWidget(group_select_all)
+            header_row.addStretch()
+            group_layout.addLayout(header_row)
+            
+            # 后缀复选框网格
+            self.group_widgets[group_name] = []
+            row_layout = QHBoxLayout()
+            row_count = 0
+            for ext in exts:
+                cb = QCheckBox(ext)
+                cb.setChecked(ext in self.selected_exts)
+                cb.stateChanged.connect(self._on_ext_changed)
+                self.group_widgets[group_name].append(cb)
+                row_layout.addWidget(cb)
+                row_count += 1
+                if row_count >= 4:
+                    row_layout.addStretch()
+                    group_layout.addLayout(row_layout)
+                    row_layout = QHBoxLayout()
+                    row_count = 0
+            if row_count > 0:
+                row_layout.addStretch()
+                group_layout.addLayout(row_layout)
+            
+            scroll_layout.addWidget(group_box)
+        
+        scroll.setWidget(scroll_widget)
+        layout.addWidget(scroll)
+        
+        # 底部统计和按钮
+        bottom_row = QHBoxLayout()
+        self.count_label = QLabel()
+        self.count_label.setStyleSheet("color: #4fc3f7; font-weight: bold;")
+        bottom_row.addWidget(self.count_label)
+        bottom_row.addStretch()
+        
+        ok_btn = QPushButton("确定")
+        ok_btn.setFixedWidth(70)
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setFixedWidth(70)
+        cancel_btn.clicked.connect(self.reject)
+        bottom_row.addWidget(ok_btn)
+        bottom_row.addWidget(cancel_btn)
+        layout.addLayout(bottom_row)
+        
+        self._update_count()
+    
+    def _select_all(self):
+        for cbs in self.group_widgets.values():
+            for cb in cbs:
+                cb.setChecked(True)
+    
+    def _deselect_all(self):
+        for cbs in self.group_widgets.values():
+            for cb in cbs:
+                cb.setChecked(False)
+    
+    def _group_select(self, group_name):
+        """组内全选"""
+        cbs = self.group_widgets.get(group_name, [])
+        all_checked = all(cb.isChecked() for cb in cbs)
+        for cb in cbs:
+            cb.setChecked(not all_checked)
+    
+    def _on_ext_changed(self):
+        self.selected_exts = self.get_selected_extensions()
+        self._update_count()
+    
+    def _update_count(self):
+        count = len(self.get_selected_extensions())
+        self.count_label.setText(f"已选择 {count} 个后缀")
+    
+    def get_selected_extensions(self):
+        """获取选择的后缀列表"""
+        selected = []
+        for cbs in self.group_widgets.values():
+            for cb in cbs:
+                if cb.isChecked():
+                    selected.append(cb.text())
+        return selected
+    
+    def get_selected_with_dot(self):
+        """获取带点的后缀列表"""
+        return ["." + ext for ext in self.get_selected_extensions()]
+
+
+class WebShellSettingsDialog(QDialog):
+    """WebShell设置对话框"""
+    
+    def __init__(self, parent=None, password="UploadRanger", shell_type="基础eval"):
+        super().__init__(parent)
+        self.setWindowTitle("WebShell 设置")
+        self.setMinimumWidth(350)
+        
+        self.password = password
+        self.shell_type = shell_type
+        
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 说明
+        info_label = QLabel("设置渗透测试模式下上传的WebShell参数")
+        info_label.setStyleSheet("color: #ff6b6b; font-size: 12px;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # 密码设置
+        pwd_layout = QHBoxLayout()
+        pwd_layout.addWidget(QLabel("连接密码:"))
+        self.password_input = QLineEdit()
+        self.password_input.setText(self.password)
+        self.password_input.setPlaceholderText("留空使用默认密码")
+        self.password_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #2d2d2d;
+                border: 1px solid #444;
+                border-radius: 3px;
+                padding: 4px 8px;
+                color: #00ff00;
+            }
+        """)
+        pwd_layout.addWidget(self.password_input)
+        layout.addLayout(pwd_layout)
+        
+        # Shell类型
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel("Shell类型:"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems(["基础eval", "Base64免杀", "冰蝎兼容", "蚁剑兼容"])
+        if self.shell_type in ["基础eval", "Base64免杀", "冰蝎兼容", "蚁剑兼容"]:
+            self.type_combo.setCurrentText(self.shell_type)
+        type_layout.addWidget(self.type_combo)
+        type_layout.addStretch()
+        layout.addLayout(type_layout)
+        
+        # 类型说明
+        type_hint = QLabel("基础eval: 最简单可靠的WebShell\nBase64免杀: 绕过基础检测\n冰蝎兼容: 冰蝎客户端连接\n蚁剑兼容: 蚁剑客户端连接")
+        type_hint.setStyleSheet("color: #888; font-size: 11px;")
+        type_hint.setWordWrap(True)
+        layout.addWidget(type_hint)
+        
+        layout.addStretch()
+        
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        ok_btn = QPushButton("确定")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_ok)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+    
+    def _on_ok(self):
+        self.password = self.password_input.text() or "UploadRanger"
+        self.shell_type = self.type_combo.currentText()
+        self.accept()
+    
+    def get_config(self):
+        """获取配置"""
+        return {
+            "password": self.password,
+            "type": self.shell_type
+        }
+
+
 class ResultsTable(QTableWidget):
     """扫描结果表格 - 显示所有测试结果"""
     
-    # 信号定义 - 用于发送到Repeater/Intruder
+    # 信号定义 - 用于发送到Repeater/Intruder/Diff
     send_to_repeater = Signal(dict)
     send_to_intruder = Signal(dict)
     
     def __init__(self):
         super().__init__()
-        self.setColumnCount(6)
-        self.setHorizontalHeaderLabels(["文件名", "类型", "状态码", "状态", "概率", "路径"])
+        self.setColumnCount(7)  # 【新增】增加验证状态列
+        self.setHorizontalHeaderLabels(["文件名", "类型", "状态码", "状态", "概率", "验证状态", "路径"])
         
         self.setColumnWidth(0, 180)
         self.setColumnWidth(1, 120)
         self.setColumnWidth(2, 60)
         self.setColumnWidth(3, 60)
         self.setColumnWidth(4, 60)
-        self.setColumnWidth(5, 250)
+        self.setColumnWidth(5, 80)  # 【新增】验证状态列
+        self.setColumnWidth(6, 250)
         
         header = self.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -92,7 +345,8 @@ class ResultsTable(QTableWidget):
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)  # 【新增】验证状态列
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
         
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QTableWidget.SelectRows)
@@ -201,7 +455,37 @@ class ResultsTable(QTableWidget):
         confidence_level = result.get('confidence_level', 'low')
         prob_item.setToolTip(f"置信度: {confidence_level}")
         
-        # 第5列：路径
+        # 【新增】第5列：验证状态
+        verification = result.get('verification', {})
+        verify_status = verification.get('status', 'N/A')
+        verify_verified = verification.get('verified', False)
+        
+        if verify_verified:
+            verify_text = "已验证"
+            verify_color = COLORS['success']
+        elif verify_status == 'error':
+            verify_text = "错误"
+            verify_color = COLORS['danger']
+        elif verify_status == 'no_path':
+            verify_text = "无路径"
+            verify_color = COLORS['text_secondary']
+        else:
+            verify_text = "未验证"
+            verify_color = COLORS['text_secondary']
+        
+        verify_item = QTableWidgetItem(verify_text)
+        verify_item.setForeground(QColor(verify_color))
+        
+        # 添加验证详情tooltip
+        verify_tooltip = f"状态: {verify_status}\n"
+        if verification.get('execution_confirmed'):
+            verify_tooltip += "执行: 已确认执行\n"
+            verify_tooltip += f"输出: {verification.get('execution_output', 'N/A')[:50]}"
+        if verification.get('error'):
+            verify_tooltip += f"错误: {verification.get('error')}"
+        verify_item.setToolTip(verify_tooltip)
+        
+        # 第6列：路径
         path = result.get('path_leaked') or ''
         path_item = QTableWidgetItem(path)
         path_item.setToolTip(path)
@@ -212,7 +496,8 @@ class ResultsTable(QTableWidget):
         self.setItem(row, 2, status_item)
         self.setItem(row, 3, status_text_item)
         self.setItem(row, 4, prob_item)
-        self.setItem(row, 5, path_item)
+        self.setItem(row, 5, verify_item)  # 【新增】验证状态
+        self.setItem(row, 6, path_item)
         
         # === 统一设置整行背景色（现在所有 item 都已存在） ===
         # 【修复】禁用交替行颜色，避免覆盖我们的自定义背景色
@@ -238,13 +523,8 @@ class ResultsTable(QTableWidget):
         """显示右键菜单"""
         menu = QMenu(self)
         
-        send_repeater_action = QAction("发送到 Repeater", self)
-        send_repeater_action.triggered.connect(self._send_result_to_repeater)
-        menu.addAction(send_repeater_action)
-        
-        send_intruder_action = QAction("发送到 Intruder", self)
-        send_intruder_action.triggered.connect(self._send_result_to_intruder)
-        menu.addAction(send_intruder_action)
+        # 注意：扫描结果不提供 Repeater/Intruder 发送，因为请求响应数据不完整
+        # 如需测试，请使用 Traffic 标签页中的完整请求
         
         menu.exec(self.viewport().mapToGlobal(position))
     
@@ -417,6 +697,15 @@ class MainWindow(QMainWindow):
         self.shell_generator = WebShellGenerator()
         self.bypass_generator = BypassPayloadGenerator()
         self.polyglot_generator = PolyglotGenerator()
+        
+        # 【新增】WebShell配置（渗透测试模式用）
+        self._webshell_config = {
+            "password": "UploadRanger",
+            "type": "基础eval"
+        }
+        
+        # 【新增】Diff对比功能 - 基准响应存储
+        self.baseline_response = None
         
         # 创建UI
         self._create_ui()
@@ -875,6 +1164,94 @@ class MainWindow(QMainWindow):
         self.discover_upload_btn.setEnabled(True)
         QMessageBox.warning(self, "发现上传点失败", msg)
     
+    def _open_extension_selector(self):
+        """打开后缀选择对话框"""
+        # 获取当前选择的后缀
+        current_exts = self._selected_extensions
+        
+        dialog = ExtensionSelectorDialog(self, current_exts)
+        if dialog.exec():
+            selected = dialog.get_selected_extensions()
+            self._selected_extensions = selected if selected else None
+            self._update_extension_label()
+            self._update_payload_hint()
+            # 根据后缀数量动态计算 payload 上限
+            ext_count = len(selected) if selected else 0
+            suggested_limit = min(ext_count * 50, 1200)  # 每个后缀50个payload，上限1200
+            if suggested_limit > 0:
+                self.payload_limit_spin.setValue(suggested_limit)
+    
+    def _update_extension_label(self):
+        """更新后缀选择标签"""
+        if self._selected_extensions is None:
+            self.ext_count_label.setText("已选: 全部")
+        else:
+            count = len(self._selected_extensions)
+            # 显示前3个后缀
+            preview = ", ".join(self._selected_extensions[:3])
+            if count > 3:
+                preview += f" 等{count}个"
+            self.ext_count_label.setText(f"已选: {preview}")
+    
+    def _on_scan_mode_changed(self):
+        """测试模式切换处理"""
+        is_penetration = self.penetration_test_rb.isChecked()
+        
+        # 启用/禁用Shell设置按钮
+        self.webshell_settings_btn.setEnabled(is_penetration)
+        
+        # 更新payload提示
+        if is_penetration:
+            self._log("[渗透测试模式] 将上传WebShell等攻击载荷")
+            config = self._webshell_config
+            self._log(f"  - WebShell密码: {config['password']}")
+            self._log(f"  - Shell类型: {config['type']}")
+        else:
+            self._log("[安全测试模式] 将上传无害内容，仅证明漏洞存在")
+    
+    def _open_webshell_settings(self):
+        """打开WebShell设置对话框"""
+        dialog = WebShellSettingsDialog(
+            self,
+            password=self._webshell_config['password'],
+            shell_type=self._webshell_config['type']
+        )
+        if dialog.exec():
+            self._webshell_config = dialog.get_config()
+            self._log(f"[Shell设置] 密码: {self._webshell_config['password']}, 类型: {self._webshell_config['type']}")
+    
+    def _get_scan_mode(self):
+        """获取当前扫描模式"""
+        return "penetration" if self.penetration_test_rb.isChecked() else "security"
+    
+    def _get_webshell_config(self):
+        """获取WebShell配置"""
+        if self.penetration_test_rb.isChecked():
+            return {
+                "enabled": True,
+                "password": self._webshell_config['password'],
+                "type": self._webshell_config['type']
+            }
+        return {"enabled": False}
+    
+    def _update_payload_hint(self):
+        """根据选择的后缀更新payload数量提示"""
+        if self._selected_extensions is None:
+            self.ext_count_label.setText("全部")
+        else:
+            count = len(self._selected_extensions)
+            self.ext_count_label.setText(f"已选{count}个")
+    
+    def _get_selected_extensions(self):
+        """获取用户选择的后缀列表"""
+        if self._selected_extensions is None:
+            # 返回所有后缀
+            all_exts = []
+            for group in ExtensionSelectorDialog.EXTENSION_GROUPS.values():
+                all_exts.extend(group)
+            return ["." + ext for ext in all_exts]
+        return ["." + ext for ext in self._selected_extensions]
+    
     def _create_tabs(self, parent_layout):
         """创建标签页"""
         self.tabs = QTabWidget()
@@ -1007,61 +1384,106 @@ class MainWindow(QMainWindow):
         
         left_layout.addWidget(target_group)
         
-        # 代理配置组
-        proxy_group = QGroupBox("代理配置")
-        proxy_layout = QVBoxLayout(proxy_group)
-        
-        self.use_proxy_cb = QCheckBox("使用代理")
-        proxy_layout.addWidget(self.use_proxy_cb)
-        
+        # 代理配置 - 【简化】一行显示
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("代理:"))
+        self.use_proxy_cb = QCheckBox("启用")
+        self.use_proxy_cb.setToolTip("使用HTTP代理")
+        proxy_row.addWidget(self.use_proxy_cb)
         self.proxy_input = QLineEdit()
-        self.proxy_input.setPlaceholderText("http://127.0.0.1:8080")
-        proxy_layout.addWidget(self.proxy_input)
+        self.proxy_input.setPlaceholderText("127.0.0.1:8080")
+        self.proxy_input.setFixedWidth(150)
+        proxy_row.addWidget(self.proxy_input)
+        proxy_row.addStretch()
+        left_layout.addLayout(proxy_row)
         
-        left_layout.addWidget(proxy_group)
-        
-        # 扫描选项组
+        # 扫描选项组 - 【优化】紧凑布局
         options_group = QGroupBox("扫描选项")
         options_layout = QVBoxLayout(options_group)
         
-        threads_layout = QHBoxLayout()
-        threads_layout.addWidget(QLabel("超时(秒):"))
+        # 第一行：测试模式 + WebShell设置按钮
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("模式:"))
+        
+        self.scan_mode_group = QButtonGroup()
+        self.security_test_rb = QRadioButton("安全")
+        self.security_test_rb.setToolTip("上传无害内容，仅证明漏洞存在")
+        self.security_test_rb.setChecked(True)
+        self.penetration_test_rb = QRadioButton("渗透")
+        self.penetration_test_rb.setToolTip("上传WebShell（需授权）")
+        
+        self.scan_mode_group.addButton(self.security_test_rb, 1)
+        self.scan_mode_group.addButton(self.penetration_test_rb, 2)
+        
+        mode_row.addWidget(self.security_test_rb)
+        mode_row.addWidget(self.penetration_test_rb)
+        
+        # WebShell设置按钮（仅渗透模式可用）
+        self.webshell_settings_btn = QPushButton("Shell设置")
+        self.webshell_settings_btn.setFixedWidth(110)  # 修复按钮显示不全
+        self.webshell_settings_btn.setEnabled(False)
+        self.webshell_settings_btn.setToolTip("设置WebShell密码和类型")
+        self.webshell_settings_btn.clicked.connect(self._open_webshell_settings)
+        mode_row.addWidget(self.webshell_settings_btn)
+        
+        mode_row.addStretch()
+        options_layout.addLayout(mode_row)
+        
+        # 连接模式切换信号
+        self.security_test_rb.toggled.connect(self._on_scan_mode_changed)
+        self.penetration_test_rb.toggled.connect(self._on_scan_mode_changed)
+        
+        # 第二行：超时和Payload上限（单行紧凑）
+        config_row = QHBoxLayout()
+        config_row.addWidget(QLabel("超时:"))
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(5, 300)
         self.timeout_spin.setValue(30)
-        threads_layout.addWidget(self.timeout_spin)
-        threads_layout.addStretch()
-        options_layout.addLayout(threads_layout)
+        self.timeout_spin.setFixedWidth(70)
+        config_row.addWidget(self.timeout_spin)
         
-        _lib_n = get_builtin_async_payload_count()
-        payload_layout = QHBoxLayout()
-        payload_layout.addWidget(QLabel("Payload上限:"))
+        config_row.addSpacing(10)
+        config_row.addWidget(QLabel("Payload上限:"))
         self.payload_limit_spin = QSpinBox()
         self.payload_limit_spin.setRange(10, 2000)
+        _lib_n = get_builtin_async_payload_count()
         self.payload_limit_spin.setValue(min(1200, max(60, _lib_n)))
+        self.payload_limit_spin.setFixedWidth(90)  # 修复输入框显示不全
         self.payload_limit_spin.setToolTip(
-            f"单次扫描最多发送的请求数上限。\n"
-            f"当前内置快速扫描词库约 {_lib_n} 条，实际请求数 ≤ min(本上限, 词库)；\n"
-            f"若开启「环境指纹」，过滤后可能更少。"
+            f"内置词库约 {_lib_n} 条，实际请求数 ≤ min(上限, 词库)"
         )
-        payload_layout.addWidget(self.payload_limit_spin)
-        payload_layout.addStretch()
-        options_layout.addLayout(payload_layout)
-        self._payload_library_hint = QLabel(
-            f"（内置词库约 {_lib_n} 条，实际 ≤ min(上限, 词库)）"
-        )
-        self._payload_library_hint.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px;")
-        self._payload_library_hint.setWordWrap(True)
-        options_layout.addWidget(self._payload_library_hint)
+        config_row.addWidget(self.payload_limit_spin)
+        config_row.addStretch()
+        options_layout.addLayout(config_row)
         
-        self.use_raw_upload_cb = QCheckBox("字节级 Raw 上传（推荐）")
+        # 第三行：选项复选框
+        options_row = QHBoxLayout()
+        self.use_raw_upload_cb = QCheckBox("Raw上传")
         self.use_raw_upload_cb.setChecked(True)
-        self.use_raw_upload_cb.setToolTip("与同步扫描器一致，multipart 由 RawHTTPClient 构造")
-        options_layout.addWidget(self.use_raw_upload_cb)
+        self.use_raw_upload_cb.setToolTip("字节级Raw multipart上传（推荐）")
+        options_row.addWidget(self.use_raw_upload_cb)
         
-        self.use_fingerprint_cb = QCheckBox("环境指纹过滤与排序（推荐）")
+        self.use_fingerprint_cb = QCheckBox("指纹过滤")
         self.use_fingerprint_cb.setChecked(True)
-        options_layout.addWidget(self.use_fingerprint_cb)
+        self.use_fingerprint_cb.setToolTip("环境指纹过滤与排序（推荐）")
+        options_row.addWidget(self.use_fingerprint_cb)
+        
+        options_row.addStretch()  # 先stretch，为按钮留出空间
+        
+        # 后缀选择按钮
+        self.ext_select_btn = QPushButton("后缀选择")
+        self.ext_select_btn.setFixedWidth(110)  # 修复按钮显示不全
+        self.ext_select_btn.setCursor(Qt.PointingHandCursor)
+        self.ext_select_btn.clicked.connect(self._open_extension_selector)
+        options_row.addWidget(self.ext_select_btn)
+        
+        self.ext_count_label = QLabel("全部")
+        self.ext_count_label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        options_row.addWidget(self.ext_count_label)
+        options_layout.addLayout(options_row)
+        
+        # 初始化后缀选择器
+        self._selected_extensions = None  # None表示全选
         
         left_layout.addWidget(options_group)
         
@@ -1667,6 +2089,40 @@ class MainWindow(QMainWindow):
         self._log(f"Raw上传: {'开' if self.use_raw_upload_cb.isChecked() else '关'}")
         self._log(f"环境指纹: {'开' if self.use_fingerprint_cb.isChecked() else '关'}")
         
+        # 获取扫描模式配置
+        scan_mode = self._get_scan_mode()
+        webshell_config = self._get_webshell_config()
+        self._log(f"测试模式: {'渗透测试' if scan_mode == 'penetration' else '安全测试'}")
+        if webshell_config.get("enabled"):
+            self._log(f"WebShell配置: 密码={webshell_config['password']}, 类型={webshell_config['type']}")
+        
+        # 获取用户选择的后缀
+        selected_exts = self._get_selected_extensions()
+        if not selected_exts:
+            self._log("错误: 请至少选择一个测试后缀")
+            return
+        
+        # 渗透模式下确认上传 EXE/脚本
+        if scan_mode == "penetration":
+            # 检查是否选择了可执行文件后缀
+            exec_exts = {'exe', 'dll', 'bat', 'cmd', 'vbs', 'ps1', 'hta', 'scr', 'cpl', 'sh', 'bash', 'elf', 'so'}
+            selected_exec = [ext for ext in selected_exts if ext.lstrip('.').lower() in exec_exts]
+            if selected_exec:
+                reply = QMessageBox.question(
+                    self,
+                    "渗透模式 - 确认上传可执行文件",
+                    f"即将上传以下类型的可执行文件：\n• {', '.join(selected_exec)}\n\n"
+                    f"这些文件可能在目标服务器执行，可能触发安全防护或造成系统损害。\n\n是否继续上传可执行文件？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply == QMessageBox.No:
+                    # 用户取消扫描
+                    self._log("[取消] 已取消扫描")
+                    return
+            
+        self._log(f"测试后缀: {', '.join(selected_exts)}")
+        
         # 收集配置
         proxy = None
         if self.use_proxy_cb.isChecked():
@@ -1701,6 +2157,9 @@ class MainWindow(QMainWindow):
             timeout=self.timeout_spin.value(),
             use_raw_multipart=self.use_raw_upload_cb.isChecked(),
             use_fingerprint=self.use_fingerprint_cb.isChecked(),
+            selected_extensions=selected_exts,
+            scan_mode=scan_mode,  # 【新增】扫描模式
+            webshell_config=webshell_config,  # 【新增】WebShell配置
         )
         
         self._log("连接工作线程信号...")

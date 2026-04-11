@@ -23,6 +23,7 @@ try:
     from .form_parser import FormParser
     from .response_analyzer import ResponseAnalyzer  # 保留用于兼容性
     from .smart_analyzer import SmartResponseAnalyzer
+    from .auto_verifier import WebShellVerifier, UploadPathExtractor  # 【新增】自动验证器
     from ..payloads.webshells import WebShellGenerator
     from ..payloads.bypass_payloads import BypassPayloadGenerator
     from ..payloads.polyglots import PolyglotGenerator
@@ -33,6 +34,7 @@ except ImportError:
     from core.form_parser import FormParser
     from core.response_analyzer import ResponseAnalyzer
     from core.smart_analyzer import SmartResponseAnalyzer
+    from core.auto_verifier import WebShellVerifier, UploadPathExtractor  # 【新增】自动验证器
     from payloads.webshells import WebShellGenerator
     from payloads.bypass_payloads import BypassPayloadGenerator
     from payloads.polyglots import PolyglotGenerator
@@ -87,6 +89,9 @@ class UploadScanner:
         
         # Intruder Payload Factory
         self.intruder_factory = PayloadFactory()
+        
+        # 【新增】WebShell验证器
+        self.verifier = WebShellVerifier(timeout=timeout, proxy=proxy)
         
         # v2.0: Payload配置
         self.payload_config = FuzzConfig()
@@ -188,6 +193,9 @@ class UploadScanner:
                         analysis = result.get("analysis", {})
                         if analysis.get("is_success") and analysis.get("uploaded_path"):
                             self.stats["successful_uploads"] += 1
+                            # 【新增】自动验证上传的文件
+                            if test_config.get("auto_verify", True):
+                                result["verification"] = self._auto_verify_upload(result, action)
                             if test_config.get("test_webshells"):
                                 result["execution_test"] = self._test_webshell_execution(result)
                 return result
@@ -471,6 +479,86 @@ Content-Disposition: form-data; name="{field_name}"
         execution_test = self.response_analyzer.check_webshell_execution(response)
         
         return execution_test
+    
+    def _auto_verify_upload(self, upload_result, form_action):
+        """
+        【新增】自动验证上传的文件是否可访问/可执行
+        
+        Args:
+            upload_result: 上传测试结果
+            form_action: 表单提交URL
+            
+        Returns:
+            dict: 验证结果
+        """
+        import asyncio
+        
+        try:
+            # 获取上传路径
+            uploaded_path = upload_result.get("analysis", {}).get("uploaded_path")
+            full_url = upload_result.get("analysis", {}).get("full_url")
+            
+            if not uploaded_path and not full_url:
+                return {
+                    "verified": False,
+                    "status": "no_path",
+                    "message": "无法获取上传路径"
+                }
+            
+            # 构建验证URL
+            verify_url = full_url
+            if not verify_url:
+                # 从form_action和uploaded_path构建
+                if uploaded_path.startswith('http'):
+                    verify_url = uploaded_path
+                else:
+                    verify_url = urljoin(form_action, uploaded_path)
+            
+            # 检测语言类型
+            filename = upload_result.get("filename", '').lower()
+            language = "php"  # 默认
+            if '.asp' in filename and '.aspx' not in filename:
+                language = "asp"
+            elif '.aspx' in filename:
+                language = "aspx"
+            elif '.jsp' in filename:
+                language = "jsp"
+            
+            # 运行异步验证
+            async def do_verify():
+                return await self.verifier.verify(verify_url, language)
+            
+            # 在新事件循环中运行
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # 如果事件循环已在运行，使用run_coroutine_threadsafe
+                    future = asyncio.run_coroutine_threadsafe(do_verify(), loop)
+                    verify_result = future.result(timeout=10)
+                else:
+                    verify_result = loop.run_until_complete(do_verify())
+            except RuntimeError:
+                # 没有事件循环，创建新的
+                verify_result = asyncio.run(do_verify())
+            
+            # 转换结果为字典格式
+            return {
+                "verified": verify_result.is_success(),
+                "status": verify_result.status.value,
+                "status_code": verify_result.response_code,
+                "url": verify_result.verified_url,
+                "execution_confirmed": verify_result.execution_confirmed,
+                "execution_output": verify_result.execution_output,
+                "response_preview": verify_result.response_preview[:200] if verify_result.response_preview else "",
+                "error": verify_result.error
+            }
+            
+        except Exception as e:
+            return {
+                "verified": False,
+                "status": "error",
+                "message": f"验证过程出错: {str(e)}"
+            }
     
     def scan(self, test_config=None):
         """执行完整扫描"""

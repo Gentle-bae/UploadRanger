@@ -15,7 +15,7 @@ Intruder Payload Generator - 文件上传漏洞Payload生成引擎
 覆盖的绕过技术: 14+ 种核心策略 + 新增的高级绕过
 
 Author: Integrated from Upload_Auto_Fuzz.py
-Version: 1.2.0
+Version: 1.1.1
 License: MIT
 """
 
@@ -30,7 +30,7 @@ from typing import List, Dict, Generator, Optional, Set
 # Constants and Configuration
 # =============================================================================
 
-VERSION = "1.2.0"
+VERSION = "1.1.1"
 MAX_PAYLOADS_DEFAULT = 2000
 MAX_FILENAME_LENGTH = 255
 

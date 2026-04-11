@@ -3,7 +3,7 @@
 ## 项目信息
 
 - **名称**: UploadRanger
-- **版本**: v1.1.0
+- **版本**: v1.1.1
 - **作者**: bae
 - **联系**: 1073723512@qq.com（有问题优先提交 GitHub Issues，便于互相帮助）
 - **描述**: 现代化文件上传漏洞测试工具
@@ -36,6 +36,7 @@
 | async_scanner.py           | 异步扫描引擎                         |
 | async_scanner_worker.py    | 异步扫描工作线程                     |
 | config_manager.py          | 配置管理器，支持JSON格式配置持久化   |
+| auto_verifier.py           | WebShell自动验证器                  |
 | form_parser.py             | 表单解析器，自动发现上传表单         |
 | http_client.py             | HTTP客户端，处理所有网络请求         |
 | models.py                  | 数据模型定义                         |

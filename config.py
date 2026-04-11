@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 UploadRanger 配置文件
-版本: 1.1.0
+版本: 1.1.1
 作者: bae
 """
 
 # 版本信息
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 AUTHOR = "bae"
 APP_NAME = "UploadRanger"
 APP_DESCRIPTION = "文件上传漏洞测试工具"
@@ -29,7 +29,7 @@ SCAN_CONFIG = {
         'html', 'htm', 'shtml', 'xml', 'svg', 'swf',
         'jpg', 'jpeg', 'png', 'gif', 'bmp', 'ico', 'webp',
         'txt', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
-        'zip', 'rar', 'tar', 'gz', 'bz2', '7z',
+        # 【删除】压缩包相关已移除（zip、rar、tar、gz、bz2、7z）
     ],
     'dangerous_extensions': [
         'php', 'php3', 'php4', 'php5', 'pht', 'phtml', 'phps', 'phar',
