@@ -361,10 +361,29 @@ QMenu {{
     background-color: {COLORS['bg_secondary']};
     color: {COLORS['text_primary']};
     border: 1px solid {COLORS['border']};
+    padding: 4px;
+    border-radius: 6px;
+}}
+
+QMenu::item {{
+    padding: 7px 28px 7px 12px;
+    border-radius: 4px;
+    margin: 1px 0px;
 }}
 
 QMenu::item:selected {{
     background-color: {COLORS['accent']};
+    color: white;
+}}
+
+QMenu::item:disabled {{
+    color: {COLORS['text_secondary']};
+}}
+
+QMenu::separator {{
+    height: 1px;
+    background: {COLORS['border']};
+    margin: 4px 8px;
 }}
 
 /* 工具提示 - 修复悬浮白色问题 */

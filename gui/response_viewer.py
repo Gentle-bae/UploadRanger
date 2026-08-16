@@ -4,6 +4,7 @@
 import json
 import re
 import xml.dom.minidom
+from html import escape
 
 try:
     import chardet
@@ -18,20 +19,22 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate, QProxyStyle, QStyle, QScrollArea
 )
 from PySide6.QtGui import QFont, QKeySequence, QPixmap
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QUrlQuery
+from urllib.parse import urljoin
 
 from .syntax_highlighter import HTTPHighlighter
 from .themes.dark_theme import COLORS
 
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
-    from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
+    from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage, QWebEngineProfile
     WEBENGINE_AVAILABLE = True
 except Exception:
     WEBENGINE_AVAILABLE = False
     QWebEngineView = None
     QWebEngineSettings = None
     QWebEnginePage = None
+    QWebEngineProfile = None
 
 
 if WEBENGINE_AVAILABLE and QWebEnginePage is not None:
@@ -78,11 +81,12 @@ class ResponseViewerWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._init_ui()
-        self._max_bytes = 2_000_000  # prevent UI freeze on huge responses
+        self._max_bytes = 10_000_000  # 保留完整常规响应，同时避免超大响应拖垮 GUI
         self._max_hex_bytes = 256_000
         # 用于 WebEngineView 刷新时存储待渲染内容
         self._pending_html: str = ""
         self._pending_url = QUrl("about:blank")
+        self._render_generation = 0
 
     def _detect_encoding(self, body_bytes: bytes, content_type: str = "") -> tuple:
         if not body_bytes:
@@ -183,6 +187,10 @@ class ResponseViewerWidget(QWidget):
                 self.render_view = QWebEngineView()
                 self.render_view.setPage(_SilentWebPage(self.render_view))
                 self._secure_webengine(self.render_view)
+                profile = self.render_view.page().profile()
+                if QWebEngineProfile is not None:
+                    profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.NoCache)
+                    profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
                 # 【修复】WebEngineView 背景设为与工具主题一致的深色背景
                 # 这样原始网页如果有自己的暗色背景可以正确显示
                 self.render_view.setStyleSheet(f"QWebEngineView {{ background-color: {COLORS['bg_primary']}; }}")
@@ -306,6 +314,7 @@ class ResponseViewerWidget(QWidget):
         return False
 
     def set_response(self, headers_text: str, body_bytes: bytes, content_type: str = "", base_url: str | None = None):
+        self._render_generation += 1
         if body_bytes is None:
             body_bytes = b""
 
@@ -347,6 +356,7 @@ class ResponseViewerWidget(QWidget):
 
         if WEBENGINE_AVAILABLE and self.render_view and not truncated:
             try:
+                self.render_view.stop()
                 # 【修复】更宽泛的HTML检测 - 检查Content-Type或HTML标签特征
                 is_html_content = (
                     "html" in content_type.lower() or 
@@ -363,19 +373,24 @@ class ResponseViewerWidget(QWidget):
                 if is_html_content and not is_binary:
                     # 确保HTML有基础结构（不覆盖原始样式）
                     html_to_render = self._ensure_html_structure(body_text)
-                    url = QUrl(base_url) if base_url else QUrl("about:blank")
+                    url = self._render_base_url(base_url)
                     # 【修复】使用 update() 强制刷新，并存储待渲染内容用于手动刷新
                     self._pending_html = html_to_render
                     self._pending_url = url
                     self.render_view.setHtml(html_to_render, baseUrl=url)
                 else:
                     # 非 HTML 内容，显示空白页面
-                    self._pending_html = ""
-                    self._pending_url = QUrl("about:blank")
-                    self.render_view.setHtml("")
+                    html_to_render = self._build_render_info_page(
+                        base_url, content_type, len(body_bytes), is_binary
+                    )
+                    url = self._render_base_url(base_url)
+                    self._pending_html = html_to_render
+                    self._pending_url = url
+                    self.render_view.setHtml(html_to_render, baseUrl=url)
             except Exception as e:
                 # 渲染错误，显示空白
                 print(f"Render error: {e}")
+                self.render_view.stop()
                 self.render_view.setHtml("")
         
         # 【修复】如果 WebEngine 不可用但有 HTML 内容，尝试在下次显示时刷新
@@ -383,7 +398,7 @@ class ResponseViewerWidget(QWidget):
             html_tags = ['<html', '<body', '<div', '<script', '<style', '<head', '<p>', '<a ', '<img', '<form']
             if any(tag in body_text[:1000].lower() for tag in html_tags):
                 self._pending_html = self._ensure_html_structure(body_text)
-                self._pending_url = QUrl(base_url) if base_url else QUrl("about:blank")
+                self._pending_url = self._render_base_url(base_url)
 
         hex_bytes = display_bytes[: self._max_hex_bytes]
         rows = self._generate_hex_rows(hex_bytes)
@@ -399,6 +414,7 @@ class ResponseViewerWidget(QWidget):
         body_bytes = result.get('body_bytes', None)
         url = result.get('url', None)
         analysis = result.get('analysis', {})
+        redirect_chain = result.get('redirect_chain') or []
         if body_bytes is None:
             body_bytes = body.encode('utf-8') if isinstance(body, str) else body
 
@@ -412,6 +428,11 @@ class ResponseViewerWidget(QWidget):
         # HTTPHighlighter 可以高亮状态码 \b\d{3}\b
         status_text = self._get_status_text(status_code)
         headers_text = f"HTTP/1.1 {status_code} {status_text}\n{headers}"
+        if redirect_chain:
+            chain_text = " -> ".join(
+                f"{item.get('status_code', '?')} {item.get('url', '')}" for item in redirect_chain
+            )
+            headers_text = f"[Redirect chain] {chain_text}\n{headers_text}"
         
         # 如果有分析结果，添加到Raw视图顶部
         if analysis:
@@ -419,7 +440,57 @@ class ResponseViewerWidget(QWidget):
             if analysis_info:
                 headers_text = f"{analysis_info}\n{'='*60}\n{headers_text}"
         
+        # 未跟随时给 Render 一个明确的 30x 页面，而不是把空响应误认为缓存。
+        if 300 <= status_code < 400 and result.get('redirect_location') and not result.get('follow_redirects'):
+            target = urljoin(url or result.get('requested_url', ''), result['redirect_location'])
+            body_bytes = (
+                "<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='Cache-Control' content='no-store'>"
+                "</head><body><h3>302/30x 重定向</h3>"
+                f"<p>目标：<a href='{target}'>{target}</a></p>"
+                "<p>启用 Repeater 的“跟踪 30x”可获取最终响应并在此直接渲染。</p>"
+                "</body></html>"
+            ).encode('utf-8')
+            content_type = 'text/html; charset=utf-8'
+            url = target
         self.set_response(headers_text, body_bytes, content_type, base_url=url)
+
+    def _render_base_url(self, base_url: str | None) -> QUrl:
+        """每次渲染使用不同 base URL，避免 WebEngine 复用上一份文档/资源缓存。"""
+        url = QUrl(base_url) if base_url else QUrl("about:blank")
+        if url.isValid() and url.scheme() in ("http", "https"):
+            query = QUrlQuery(url)
+            query.addQueryItem("__uploadranger_render", str(self._render_generation))
+            url.setQuery(query)
+        return url
+
+    @staticmethod
+    def _build_render_info_page(base_url: str | None, content_type: str, size: int, is_binary: bool) -> str:
+        kind = "二进制文件" if is_binary else "非 HTML 响应"
+        url = escape(base_url or "about:blank")
+        ctype = escape(content_type or "unknown")
+        return f"""<!doctype html><html><head><meta charset='utf-8'>
+        <meta http-equiv='Cache-Control' content='no-store'>
+        <style>body{{font-family:Segoe UI,Arial,sans-serif;background:#202133;color:#eee;padding:24px}}
+        .card{{max-width:760px;border:1px solid #4b4769;border-radius:8px;padding:18px;background:#292a3d}}
+        code{{color:#9b70ff;word-break:break-all}}</style></head><body><div class='card'>
+        <h3>最终响应为{kind}</h3><p>Render 不会把该内容作为 HTML 执行，因此不会再显示白页。</p>
+        <p>URL：<code>{url}</code></p><p>Content-Type：<code>{ctype}</code></p>
+        <p>大小：<code>{size}</code> bytes</p><p>请在 Raw / Hex 查看原始内容。</p>
+        </div></body></html>"""
+
+    @staticmethod
+    def _build_render_info_page(base_url: str | None, content_type: str, size: int, is_binary: bool) -> str:
+        kind = "二进制文件" if is_binary else "非 HTML 响应"
+        return f"""<!doctype html><html><head><meta charset='utf-8'>
+        <meta http-equiv='Cache-Control' content='no-store'>
+        <style>body{{font-family:Segoe UI,Arial,sans-serif;background:#202133;color:#eee;padding:24px}}
+        .card{{max-width:760px;border:1px solid #4b4769;border-radius:8px;padding:18px;background:#292a3d}}
+        code{{color:#9b70ff;word-break:break-all}}</style></head><body><div class='card'>
+        <h3>最终响应为{kind}</h3><p>Render 不会把该内容作为 HTML 执行，因此不会再显示白页。</p>
+        <p>URL：<code>{escape(base_url or 'about:blank')}</code></p>
+        <p>Content-Type：<code>{escape(content_type or 'unknown')}</code></p>
+        <p>大小：<code>{size}</code> bytes</p><p>请在 Raw / Hex 查看原始内容。</p>
+        </div></body></html>"""
     
     def _get_status_text(self, status_code: int) -> str:
         """获取状态码对应的文本描述"""
@@ -586,12 +657,11 @@ class ResponseViewerWidget(QWidget):
         
         try:
             # 强制刷新 WebEngineView
-            if hasattr(self, '_pending_html'):
+            if hasattr(self, '_pending_html') and self._pending_html:
                 html = self._pending_html
                 base_url = self._pending_url
+                self.render_view.stop()
                 self.render_view.setHtml(html, baseUrl=base_url)
-                self._pending_html = None
-                self._pending_url = None
         except Exception:
             pass
 
@@ -658,6 +728,7 @@ class ResponseViewerWidget(QWidget):
             self.image_label.setPixmap(QPixmap())
 
     def clear(self):
+        self._render_generation += 1
         """【修复】安全清空所有视图，避免程序退出时卡住"""
         self.raw_view.clear()
         self.pretty_view.clear()

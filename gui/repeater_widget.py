@@ -91,7 +91,7 @@ class RepeaterWorker(QThread):
     async def _send_request(self):
         url = self.request_data.get('url', '')
         method = self.request_data.get('method', 'GET')
-        headers = self.request_data.get('headers', {})
+        headers = dict(self.request_data.get('headers', {}) or {})
         body = self.request_data.get('body', '')
         follow_redirects = bool(self.request_data.get('follow_redirects', False))
 
@@ -100,11 +100,14 @@ class RepeaterWorker(QThread):
 
         headers.pop('Content-Length', None)
         headers.pop('content-length', None)
+        # Repeater 必须看到当前这次请求的结果，避免代理/浏览器复用旧缓存。
+        headers['Cache-Control'] = 'no-cache, no-store, max-age=0'
+        headers['Pragma'] = 'no-cache'
 
         # Default Burp-like behavior: do NOT auto-follow redirects.
         # When enabled, this may turn a single POST into POST+GET and the final page may include
         # accumulated session flash messages.
-        async with httpx.AsyncClient(verify=False, timeout=30, follow_redirects=follow_redirects) as client:
+        async with httpx.AsyncClient(verify=True, timeout=30, follow_redirects=follow_redirects) as client:
             request_kwargs = {'headers': headers}
             if body:
                 request_kwargs['content'] = body.encode('utf-8') if isinstance(body, str) else body
@@ -123,17 +126,35 @@ class RepeaterWorker(QThread):
                 response = await client.request(method, url, **request_kwargs)
 
             res_headers = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
+            redirect_chain = [
+                {
+                    'status_code': item.status_code,
+                    'url': str(item.url),
+                    'location': item.headers.get('location', ''),
+                }
+                for item in response.history
+            ]
+            redirect_chain.append({
+                'status_code': response.status_code,
+                'url': str(response.url),
+                'location': response.headers.get('location', ''),
+            })
             return {
                 'status_code': response.status_code,
                 'headers': res_headers,
                 'body': response.text,
                 'body_bytes': response.content,
                 'url': str(response.url),
+                'requested_url': url,
+                'follow_redirects': follow_redirects,
+                'redirect_chain': redirect_chain,
+                'redirect_location': response.headers.get('location', ''),
             }
 
 
 class RepeaterTab(QWidget):
     request_sent = Signal(dict, str)
+    send_to_scanner = Signal(dict)
 
     def __init__(self, tab_name: str = "Repeater"):
         super().__init__()
@@ -194,9 +215,15 @@ class RepeaterTab(QWidget):
         self.send_btn.clicked.connect(self._send_request)
         control_layout.addWidget(self.send_btn)
 
-        self.follow_redirects_cb = QCheckBox("跟随重定向")
+        self.send_scanner_btn = QPushButton("发送到扫描器")
+        self.send_scanner_btn.setToolTip("使用当前 Raw 请求作为扫描入口")
+        self.send_scanner_btn.setObjectName("success")
+        self.send_scanner_btn.clicked.connect(self._send_to_scanner)
+        control_layout.addWidget(self.send_scanner_btn)
+
+        self.follow_redirects_cb = QCheckBox("跟踪 30x")
         self.follow_redirects_cb.setToolTip("开启后会自动跟随 30x 跳转并展示最终页面；关闭则只显示本次请求的直接响应（更接近 Burp Repeater 默认行为）")
-        self.follow_redirects_cb.setChecked(False)
+        self.follow_redirects_cb.setChecked(True)
         control_layout.addWidget(self.follow_redirects_cb)
 
         self.strip_cookie_cb = QCheckBox("本次不带Cookie")
@@ -336,6 +363,14 @@ class RepeaterTab(QWidget):
         self.res_display.clear()
         self.res_status_label.setText("")
 
+    def _send_to_scanner(self):
+        """将当前 Raw 请求直接交给主窗口扫描器。"""
+        req_text = self.req_edit.toPlainText().strip()
+        if not req_text:
+            QMessageBox.warning(self, "发送到扫描器", "当前请求内容为空")
+            return
+        self.send_to_scanner.emit({"raw_request": req_text})
+
     def _extract_filename_from_request(self, req_text: str) -> str:
         """从请求中提取文件名"""
         # 查找 filename="xxx" 模式
@@ -469,7 +504,7 @@ class RepeaterTab(QWidget):
         # 添加分隔符
         menu.addSeparator()
         
-        # 添加"发送到Intruder"选项
+        send_scanner_action = menu.addAction("发送到扫描器")
         send_intruder_action = menu.addAction("发送到 Intruder")
         
         # 显示菜单并获取用户选择
@@ -477,6 +512,10 @@ class RepeaterTab(QWidget):
         
         if action == send_intruder_action:
             self._send_to_intruder()
+        elif action == send_scanner_action:
+            req_text = self.req_edit.toPlainText().strip()
+            if req_text:
+                self.send_to_scanner.emit({"raw_request": req_text})
     
     def _send_to_intruder(self):
         """【新增】发送当前请求到Intruder"""
@@ -515,7 +554,9 @@ class RepeaterTab(QWidget):
             'method': method,
             'url': url,
             'request_headers': '\n'.join([f"{k}: {v}" for k, v in headers.items()]),
-            'request_body': body
+            'request_body': body,
+            # 保留用户当前编辑器中的原始请求，便于后续模块按同一字节流导入。
+            'raw_request': req_text,
         }
         
         # 发送信号到主窗口，请求创建新标签
@@ -752,6 +793,8 @@ class PayloadSelectDialog(QDialog):
 
 
 class RepeaterWidget(QWidget):
+    send_to_scanner = Signal(dict)
+    send_to_intruder = Signal(dict)
     """多标签页Repeater组件 (Burp-style)"""
     
     def __init__(self):
@@ -818,11 +861,17 @@ class RepeaterWidget(QWidget):
         self._tab_counter += 1
         
         tab = RepeaterTab(name)
+        tab.send_to_scanner.connect(self.send_to_scanner.emit)
+        tab.request_sent.connect(self._on_request_sent)
         self.content_stack.addWidget(tab)
         tab_index = self.tab_bar.addTab(name)
         
         self.tab_bar.setCurrentIndex(tab_index)
         return tab_index, tab
+
+    def _on_request_sent(self, request_data: dict, target: str = ""):
+        if target == "intruder_new":
+            self.send_to_intruder.emit(dict(request_data or {}))
     
     def _on_new_tab(self):
         """新建标签"""

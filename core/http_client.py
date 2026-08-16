@@ -17,7 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class HTTPClient:
     """HTTP客户端类"""
     
-    def __init__(self, timeout=30, proxy=None, verify_ssl=False, delay=0):
+    def __init__(self, timeout=30, proxy=None, verify_ssl=True, delay=0):
         self.session = requests.Session()
         self.timeout = timeout
         self.proxy = proxy

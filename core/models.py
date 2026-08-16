@@ -7,6 +7,7 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import base64
 
 
 @dataclass
@@ -21,9 +22,14 @@ class TrafficLog:
     request_body: str
     response_headers: str
     response_body: str
+    response_body_bytes: bytes = b""
+    request_raw: bytes = b""
+    parent_log_id: Optional[int] = None
+    is_verification: bool = False
     is_success: bool = False  # 【新增】是否成功上传（用于颜色渲染）
     
     def to_dict(self) -> Dict[str, Any]:
+        raw = self.response_body_bytes or b""
         return {
             'id': self.id,
             'timestamp': self.timestamp,
@@ -34,6 +40,12 @@ class TrafficLog:
             'request_body': self.request_body,
             'response_headers': self.response_headers,
             'response_body': self.response_body,
+            # MCP/JSON 不能直接序列化 bytes；保留可还原的 base64，同时给出长度。
+            'response_body_bytes': base64.b64encode(raw).decode('ascii') if raw else '',
+            'response_body_bytes_length': len(raw),
+            'raw_request': self.request_raw.decode('latin-1', errors='replace') if self.request_raw else '',
+            'parent_log_id': self.parent_log_id,
+            'is_verification': self.is_verification,
             'is_success': self.is_success
         }
 

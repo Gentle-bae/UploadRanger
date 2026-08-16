@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QPushButton,
     QMessageBox,
+    QComboBox,
+    QSpinBox,
 )
 from PySide6.QtCore import QThread, Signal
 
@@ -96,10 +98,22 @@ class _TargetPage(QWizardPage):
         self._upload_dir.setPlaceholderText("http://example.com/uploads/ （可选，用于二次验证）")
         form.addRow("上传目录 URL:", self._upload_dir)
         
+        self._strategy = QComboBox()
+        self._strategy.addItem("自适应（验证成功后跳过同后缀）", "adaptive")
+        self._strategy.addItem("全量（逐项测试）", "full")
+        form.addRow("扫描策略:", self._strategy)
+
+        self._payload_limit = QSpinBox()
+        self._payload_limit.setRange(10, 2000)
+        self._payload_limit.setValue(300)
+        form.addRow("Payload 上限:", self._payload_limit)
+
         self.setLayout(form)
         self.registerField("targetUrl*", self._url)
         self.registerField("fileParam*", self._param)
         self.registerField("uploadDir", self._upload_dir)
+        self.registerField("strategyMode", self._strategy, "currentData")
+        self.registerField("payloadLimit", self._payload_limit, "value")
         self._url.textChanged.connect(lambda _: self._on_url_changed())
     
     def _on_url_changed(self):
@@ -200,6 +214,8 @@ class QuickScanWizard(QWizard):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("UploadRanger — 快速向导")
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
+        self.setMinimumSize(620, 430)
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
         self.addPage(_IntroPage())
         self.addPage(_TargetPage())

@@ -42,10 +42,8 @@ def test_imports():
     modules = [
         # 核心模块
         ("config", "配置模块"),
-        ("core.http_client", "HTTPClient (同步)"),
         ("core.form_parser", "FormParser"),
         ("core.response_analyzer", "ResponseAnalyzer (同步)"),
-        ("core.scanner", "UploadScanner (同步)"),
         ("core.models", "数据模型"),
         ("core.config_manager", "配置管理器"),
         # 异步模块
@@ -150,14 +148,14 @@ def test_config():
         return False
 
 def test_http_client():
-    """测试HTTP客户端"""
-    print_header("测试HTTP客户端")
+    """测试异步HTTP客户端"""
+    print_header("测试异步HTTP客户端")
     
     try:
-        from core.http_client import HTTPClient
+        from core.async_http_client import AsyncHTTPClient
         
-        client = HTTPClient()
-        print_success("HTTPClient 创建成功")
+        client = AsyncHTTPClient()
+        print_success("AsyncHTTPClient 创建成功")
         print_info(f"超时设置: {client.timeout}s")
         
         return True
@@ -171,9 +169,9 @@ def test_form_parser():
     
     try:
         from core.form_parser import FormParser
-        from core.http_client import HTTPClient
+        from core.async_http_client import AsyncHTTPClient
         
-        parser = FormParser(HTTPClient())
+        parser = FormParser(AsyncHTTPClient())
         print_success("FormParser 创建成功")
         
         # 测试解析HTML
@@ -183,7 +181,8 @@ def test_form_parser():
             <input type="submit" value="Upload" />
         </form>
         '''
-        forms = parser.parse_forms(html, "http://example.com")
+        forms = parser.parse_forms("http://example.com", html)
+        assert len(forms) == 1, f"expected one form, got {len(forms)}"
         print_success(f"解析表单: {len(forms)} 个")
         
         if forms:
@@ -221,12 +220,7 @@ def test_scanner():
     print_header("测试扫描器")
     
     try:
-        from core.scanner import UploadScanner
         from core.async_scanner import AsyncScanner
-        
-        # 同步扫描器
-        scanner = UploadScanner("http://example.com/upload")
-        print_success("UploadScanner (同步) 创建成功")
         
         # 异步扫描器
         async_scanner = AsyncScanner()

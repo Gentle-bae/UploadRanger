@@ -14,11 +14,11 @@ from PySide6.QtWidgets import (
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QGroupBox, QProgressBar, QSpinBox,
     QCheckBox, QTabWidget, QFileDialog, QMessageBox, QPlainTextEdit,
-    QApplication, QFrame, QSizePolicy, QProxyStyle, QStyle, QTabBar,
+    QApplication, QFrame, QSizePolicy, QProxyStyle, QStyle, QTabBar, QMenu,
     QStackedWidget, QInputDialog
 )
 from PySide6.QtCore import Qt, Signal, QThread
-from PySide6.QtGui import QColor, QFont, QTextCursor
+from PySide6.QtGui import QColor, QFont, QTextCursor, QKeySequence
 
 from .themes.dark_theme import COLORS
 from .syntax_highlighter import HTTPHighlighter
@@ -64,20 +64,19 @@ class IntruderWorker(QThread):
     error_signal = Signal(str)
     
     def __init__(self, base_request: dict, payloads: List[List[str]], 
-                 attack_mode: str = "sniper", threads: int = 10):
+                 attack_mode: str = "sniper", threads: int = 10,
+                 follow_redirects: bool = False):
         super().__init__()
         self.base_request = base_request
         self.payloads = payloads
         self.attack_mode = attack_mode
         self.threads = threads
+        self.follow_redirects = follow_redirects
         self._is_running = True
         self._loop = None
     
     def stop(self):
         self._is_running = False
-        if self._loop and self._loop.is_running():
-            self._loop.stop()
-        self.wait(1000)
     
     def run(self):
         import sys
@@ -108,6 +107,7 @@ class IntruderWorker(QThread):
         if not url.startswith(('http://', 'https://')):
             url = 'http://' + url
         
+        headers = dict(headers or {})
         headers.pop('Content-Length', None)
         headers.pop('content-length', None)
         
@@ -124,7 +124,7 @@ class IntruderWorker(QThread):
             self.error_signal.emit("没有生成任何请求")
             return
         
-        semaphore = asyncio.Semaphore(self.threads)
+        semaphore = asyncio.Semaphore(max(1, self.threads))
         completed = [0]
         lock = asyncio.Lock()
         
@@ -141,9 +141,14 @@ class IntruderWorker(QThread):
                     current = completed[0]
                 self.progress_update.emit(current, total)
         
-        tasks = [send_request_with_limit(i, req) for i, req in enumerate(requests)]
-        await asyncio.gather(*tasks)
-        self.finished_signal.emit()
+        tasks = [asyncio.create_task(send_request_with_limit(i, req)) for i, req in enumerate(requests)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            self.finished_signal.emit()
     
     def _get_payload_positions(self, url: str, headers: dict, body: str) -> List[Tuple[str, int, int]]:
         positions = []
@@ -306,7 +311,7 @@ class IntruderWorker(QThread):
         request_str = "\n".join(request_lines)
         
         try:
-            async with httpx.AsyncClient(verify=False, timeout=30, follow_redirects=True) as client:
+            async with httpx.AsyncClient(verify=True, timeout=15, follow_redirects=self.follow_redirects) as client:
                 request_kwargs = {'headers': headers}
                 if body:
                     if isinstance(body, str):
@@ -336,6 +341,9 @@ class IntruderWorker(QThread):
                     'body': response.text,
                     'body_bytes': response.content,
                     'headers': response_headers,
+                    'url': str(response.url),
+                    'redirect_location': response.headers.get('location', ''),
+                    'follow_redirects': self.follow_redirects,
                     'request': request_str,  # 添加请求数据
                     'error': ''
                 }
@@ -400,6 +408,11 @@ class IntruderTab(QWidget):
         self.thread_spin.setValue(10)
         self.thread_spin.setFixedWidth(70)
         top_layout.addWidget(self.thread_spin)
+
+        self.follow_redirects_cb = QCheckBox("跟随重定向")
+        self.follow_redirects_cb.setToolTip("关闭时保留直接 3xx；开启后使用最终响应进行 Render 展示")
+        self.follow_redirects_cb.setChecked(False)
+        top_layout.addWidget(self.follow_redirects_cb)
         
         top_layout.addStretch()
         
@@ -745,6 +758,8 @@ class IntruderTab(QWidget):
         self.results_table.setAlternatingRowColors(True)
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.results_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_table.customContextMenuRequested.connect(self._show_results_menu)
         self.results_table.setStyle(_NoFocusStyle(self.results_table.style()))
         self.results_table.itemClicked.connect(self._show_result_detail)
         
@@ -1091,6 +1106,8 @@ class IntruderTab(QWidget):
             return
         
         self.results_table.setRowCount(0)
+        # 保持与字典/实际发包序一致；攻击期间允许用户手动排序会造成“结果错位”错觉。
+        self.results_table.setSortingEnabled(False)
         self.detail_text.clear()
         self.detail_status.setText("")
         self.detail_length.setText("")
@@ -1105,7 +1122,8 @@ class IntruderTab(QWidget):
             base_request=base_request,
             payloads=self.payload_sets,  # 使用所有集合
             attack_mode=self.current_mode,
-            threads=self.thread_spin.value()
+            threads=self.thread_spin.value(),
+            follow_redirects=self.follow_redirects_cb.isChecked()
         )
         
         self.worker.result_ready.connect(self._on_result)
@@ -1123,7 +1141,9 @@ class IntruderTab(QWidget):
     def _stop_attack(self):
         if self.worker:
             self.worker.stop()
-            self.worker.wait()
+            # 不在 GUI 线程无限等待网络请求；worker 会在当前请求超时后自行结束。
+            if self.worker.isFinished():
+                self.worker = None
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
@@ -1195,6 +1215,11 @@ class IntruderTab(QWidget):
                 self.detail_status.setText(f"状态码: {result['status_code']}")
                 self.detail_length.setText(f"长度: {result['length']} bytes")
                 self.detail_payload.setText(f"Payload: {result['payload']}")
+                redirect_note = result.get('redirect_location', '')
+                if redirect_note:
+                    self.detail_status.setText(
+                        f"状态码: {result['status_code']} | Location: {redirect_note}"
+                    )
                 
                 # 显示请求
                 request_str = result.get('request', '')
@@ -1245,7 +1270,26 @@ class IntruderTab(QWidget):
                     self.response_text.setPlainText(response_str)
                 
                 # 兼容旧的detail_text
-                self.detail_text.setPlainText(result.get('body', ''))
+                full_response = (
+                    f"HTTP/1.1 {result.get('status_code', 0)}\n"
+                    f"{result.get('headers', '')}\n\n"
+                    f"{result.get('body', '')}"
+                )
+                self.detail_text.setPlainText(full_response)
+
+    def _show_results_menu(self, pos):
+        menu = QMenu(self.results_table)
+        copy_action = menu.addAction("复制选中内容")
+        copy_action.triggered.connect(self._copy_results)
+        menu.exec(self.results_table.viewport().mapToGlobal(pos))
+
+    def _copy_results(self):
+        ranges = self.results_table.selectedRanges()
+        if not ranges:
+            return
+        rows = sorted({row for r in ranges for row in range(r.topRow(), r.bottomRow() + 1)})
+        text = "\n".join("\t".join((self.results_table.item(row, col).text() if self.results_table.item(row, col) else "") for col in range(self.results_table.columnCount())) for row in rows)
+        QApplication.clipboard().setText(text)
     
     def load_request(self, request_data: dict):
         """加载请求到Intruder"""

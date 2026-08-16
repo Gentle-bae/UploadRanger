@@ -23,6 +23,7 @@ class ProxyHistoryTab(QWidget):
     
     send_to_repeater = Signal(object)
     send_to_intruder = Signal(object)
+    send_to_scanner = Signal(object)
     
     def __init__(self, proxy_thread: 'ProxyThread' = None, config_manager: ConfigManager = None):
         super().__init__()
@@ -470,13 +471,19 @@ class ProxyHistoryTab(QWidget):
             self.history_table.selectRow(row)
         
         menu = QMenu(self)
+        copy_action = menu.addAction("复制选中行")
+        copy_action.setEnabled(row >= 0)
+        copy_action.triggered.connect(self._copy_selected_row)
+        menu.addSeparator()
         
         send_rep_action = menu.addAction("发送到 Repeater")
         send_int_action = menu.addAction("发送到 Intruder")
+        send_scan_action = menu.addAction("发送到扫描器")
         menu.addSeparator()
         clear_action = menu.addAction("清空历史记录")
         send_rep_action.setEnabled(row >= 0)
         send_int_action.setEnabled(row >= 0)
+        send_scan_action.setEnabled(row >= 0)
         
         action = menu.exec(self.history_table.mapToGlobal(pos))
         
@@ -484,8 +491,17 @@ class ProxyHistoryTab(QWidget):
             self._send_to_repeater()
         elif action == send_int_action:
             self._send_to_intruder()
+        elif action == send_scan_action:
+            self._send_to_scanner()
         elif action == clear_action:
             self.clear_history()
+
+    def _copy_selected_row(self):
+        row = self.history_table.currentRow()
+        if row < 0:
+            return
+        text = "\t".join((self.history_table.item(row, c).text() if self.history_table.item(row, c) else "") for c in range(self.history_table.columnCount()))
+        QApplication.clipboard().setText(text)
     
     def _send_to_repeater(self):
         """发送到Repeater"""
@@ -500,6 +516,11 @@ class ProxyHistoryTab(QWidget):
         if row >= 0 and row < len(self.history):
             req = self.history[row]
             self.send_to_intruder.emit(req.to_dict())
+
+    def _send_to_scanner(self):
+        row = self.history_table.currentRow()
+        if 0 <= row < len(self.history):
+            self.send_to_scanner.emit(self.history[row].to_dict())
     
     def _open_filter_dialog(self):
         """【新增】打开过滤配置对话框"""
@@ -737,5 +758,3 @@ class ProxyHistoryTab(QWidget):
         
         # 应用过滤
         self._do_apply_filter()
-
-

@@ -8,6 +8,7 @@ import base64
 import random
 import string
 import textwrap
+import re
 
 
 class WebShellGenerator:
@@ -323,9 +324,45 @@ class WebShellGenerator:
         
         shell = shells[language][shell_type].copy()
         password = custom_password or self.password
-        # 只替换 {password} 占位符，保留其他大括号
+        code_before = str(shell.get("code", ""))
+        usage_before = str(shell.get("usage", ""))
+        uses_password = "{password}" in code_before or "{password}" in usage_before
+        # 代码和用法说明都必须使用同一个最终密码。旧版 PHP
+        # get_php_shells() 的 usage 已经插入了默认随机密码，不能只替换代码占位符。
         shell["code"] = shell["code"].replace("{password}", password)
-        shell["password"] = password
+        usage = shell.get("usage")
+        if isinstance(usage, str):
+            usage = usage.replace("{password}", password)
+            if self.password and self.password in usage:
+                usage = usage.replace(self.password, password)
+            shell["usage"] = usage
+        if custom_password:
+            # 将所有常见的命令参数名统一替换为用户指定的访问参数名。
+            # 仅匹配请求参数访问语法，不做全局字符串替换，避免误改代码内容。
+            parameter_names = ("cmd", "command", "x")
+            for name in parameter_names:
+                shell["code"] = re.sub(
+                    rf"((?:_REQUEST|_GET|_POST)\s*\[\s*['\"]){re.escape(name)}(['\"]\s*\])",
+                    rf"\g<1>{password}\g<2>", shell["code"]
+                )
+                shell["code"] = re.sub(
+                    rf"((?:Request|request)\s*\.?\s*(?:QueryString|Form|Params?)\s*\(\s*['\"]){re.escape(name)}(['\"]\s*\))",
+                    rf"\g<1>{password}\g<2>", shell["code"]
+                )
+            if isinstance(shell.get("usage"), str):
+                for name in parameter_names:
+                    shell["usage"] = re.sub(rf"([?&]|POST:\s*){re.escape(name)}(?==|\s*=)", rf"\g<1>{password}", shell["usage"])
+                shell["code"] = re.sub(r"(\$_(?:GET|POST|REQUEST)\s*\[\s*)1(\s*\])", rf"\g<1>{password}\g<2>", shell["code"])
+                shell["usage"] = re.sub(r"([?&]|POST:\s*)1(?==|\s*=)", rf"\g<1>{password}", shell["usage"])
+                # 数字下标形式必须保持 PHP 字符串键语法。
+                shell["code"] = re.sub(
+                    rf"(\$_(?:GET|POST|REQUEST)\s*\[\s*){re.escape(password)}(\s*\])",
+                    rf"\g<1>'{password}'\g<2>", shell["code"]
+                )
+            if shell["code"] != code_before or shell.get("usage", usage_before) != usage_before:
+                uses_password = True
+        # 不带密码占位符的 Shell（如 simple_eval）不应伪装成已使用自定义密码。
+        shell["password"] = password if uses_password else None
         
         return shell
     

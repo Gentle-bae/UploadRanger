@@ -36,8 +36,13 @@ class AsyncScannerWorker(QThread):
         use_raw_multipart=True,
         use_fingerprint=True,
         selected_extensions=None,  # 【新增】用户选择的后缀
+        extra_fields=None,
         scan_mode="security",  # 【新增】扫描模式: security / penetration
         webshell_config=None,  # 【新增】WebShell配置
+        request_template=None,
+        custom_payloads=None,
+        strategy_mode="adaptive",
+        resume_from=0,
     ):
         super().__init__()
         self.target_url = target_url
@@ -51,8 +56,13 @@ class AsyncScannerWorker(QThread):
         self.use_raw_multipart = use_raw_multipart
         self.use_fingerprint = use_fingerprint
         self.selected_extensions = selected_extensions or [".php", ".phtml", ".php3", ".php4", ".php5", ".phar", ".asp", ".aspx", ".cer", ".cdx", ".asa", ".jsp", ".jspx", ".jspf", ".jhtml", ".pl", ".cgi", ".py"]
+        self.extra_fields = extra_fields or {}
         self.scan_mode = scan_mode
         self.webshell_config = webshell_config or {"enabled": False}
+        self.request_template = request_template
+        self.custom_payloads = custom_payloads or []
+        self.strategy_mode = strategy_mode
+        self.resume_from = resume_from
         self.scanner = AsyncScanner()
         
         # 确保信号连接正常工作
@@ -141,8 +151,13 @@ class AsyncScannerWorker(QThread):
                     use_raw_multipart=self.use_raw_multipart,
                     use_fingerprint=self.use_fingerprint,
                     selected_extensions=self.selected_extensions,
+                    extra_fields=self.extra_fields,
                     scan_mode=self.scan_mode,  # 【新增】
                     webshell_config=self.webshell_config,  # 【新增】
+                    request_template=self.request_template,
+                    custom_payloads=self.custom_payloads,
+                    strategy_mode=self.strategy_mode,
+                    resume_from=self.resume_from,
                 ))
                 
                 print(f"[AsyncScannerWorker] scanner.scan()完成")
@@ -196,6 +211,8 @@ class AsyncScannerWorker(QThread):
         try:
             self.progress.emit("正在停止扫描...")
             self.scanner.stop()
+            # GUI 线程不能在此 wait()；当前请求完成后 run() 会自然结束。
+            return
             self.progress.emit("扫描器已标记停止，等待当前请求完成...")
 
             if self.isRunning():

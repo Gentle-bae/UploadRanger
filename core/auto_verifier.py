@@ -8,6 +8,7 @@ WebShell 自动验证器
 import re
 import asyncio
 import httpx
+import json
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
@@ -30,8 +31,8 @@ class VerificationResult:
     response_code: int                  # HTTP状态码
     response_preview: str               # 响应内容预览
     execution_confirmed: bool           # 是否确认可执行
-    execution_output: Optional[str]    # 执行输出
-    error: Optional[str]                # 错误信息
+    execution_output: Optional[str] = None    # 执行输出
+    error: Optional[str] = None                # 错误信息
     
     def is_success(self) -> bool:
         """是否成功"""
@@ -68,9 +69,14 @@ class WebShellVerifier:
         }
     }
     
-    def __init__(self, timeout: int = 10, proxies: Optional[Dict] = None):
+    def __init__(self, timeout: int = 10, proxy: Optional[str] = None,
+                 proxies: Optional[Dict] = None, verify_ssl: bool = True):
         self.timeout = timeout
-        self.proxies = proxies
+        # 同时兼容旧版 proxy= 与多协议 proxies= 调用方。
+        if proxies is None and proxy:
+            proxies = {"http://": proxy, "https://": proxy}
+        self.proxies = proxies or {}
+        self.verify_ssl = verify_ssl
     
     async def verify(self, upload_url: str, language: str = "php") -> VerificationResult:
         """
@@ -99,11 +105,21 @@ class WebShellVerifier:
         
         # 尝试验证
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                proxies=self.proxies,
-                follow_redirects=True
-            ) as client:
+            client_kwargs = {
+                "timeout": self.timeout,
+                "verify": self.verify_ssl,
+                "follow_redirects": True,
+            }
+            # httpx 0.28 使用 proxy=；多协议场景用 mounts。
+            if self.proxies:
+                mounts = {
+                    scheme: httpx.AsyncHTTPTransport(proxy=url)
+                    for scheme, url in self.proxies.items()
+                    if url
+                }
+                if mounts:
+                    client_kwargs["mounts"] = mounts
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(verify_url)
                 
                 # 检查响应

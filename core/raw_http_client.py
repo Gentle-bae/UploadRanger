@@ -14,6 +14,8 @@ RawSocket HTTP客户端 - 字节级HTTP控制引擎
 import socket
 import ssl
 import re
+import gzip
+import zlib
 import time
 import random
 import hashlib
@@ -325,7 +327,7 @@ class RawHTTPClient:
     def __init__(self, 
                  timeout: int = DEFAULT_TIMEOUT, 
                  proxy: Optional[str] = None,
-                 verify_ssl: bool = False,
+                 verify_ssl: bool = True,
                  delay: float = 0,
                  user_agent: Optional[str] = None):
         self.timeout = timeout
@@ -646,7 +648,16 @@ class RawHTTPClient:
                 elapsed_time=elapsed
             )
         
-        # 查找header和body的分隔
+        # 跳过 1xx 中间响应，直到最终响应。
+        while True:
+            header_end = data.find(b'\r\n\r\n')
+            if header_end == -1:
+                break
+            first_line = data[:header_end].split(b'\r\n', 1)[0]
+            match = re.match(rb'HTTP/\d\.\d\s+(\d+)', first_line)
+            if not match or not (100 <= int(match.group(1)) < 200) or int(match.group(1)) == 101:
+                break
+            data = data[header_end + 4:]
         header_end = data.find(b'\r\n\r\n')
         if header_end == -1:
             return RawHTTPResponse(
@@ -676,11 +687,25 @@ class RawHTTPClient:
         for line in header_lines[1:]:
             if ':' in line:
                 key, value = line.split(':', 1)
-                headers[key.strip().lower()] = value.strip()
+                key = key.strip().lower()
+                value = value.strip()
+                if key == 'set-cookie' and key in headers:
+                    headers[key] = headers[key] + '\n' + value
+                else:
+                    headers[key] = value
         
         # 处理chunked编码
         if headers.get('transfer-encoding', '').lower() == 'chunked':
             body = self._decode_chunked(body)
+
+        encoding = headers.get('content-encoding', '').lower()
+        try:
+            if 'gzip' in encoding:
+                body = gzip.decompress(body)
+            elif 'deflate' in encoding:
+                body = zlib.decompress(body)
+        except (OSError, zlib.error):
+            pass
         
         # 更新cookies
         if 'set-cookie' in headers:
@@ -788,7 +813,7 @@ class RawHTTPClient:
         builder.headers['User-Agent'] = self.user_agent
         builder.headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
         builder.headers['Accept-Language'] = 'zh-CN,zh;q=0.9,en;q=0.8'
-        builder.headers['Accept-Encoding'] = 'gzip, deflate'
+        builder.headers['Accept-Encoding'] = 'identity'
         # 【修复】禁用keep-alive，避免连接复用导致的超时问题
         builder.headers['Connection'] = 'close'
         

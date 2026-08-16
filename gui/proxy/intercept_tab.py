@@ -21,6 +21,7 @@ class ProxyInterceptTab(QWidget):
     
     send_to_repeater = Signal(object)
     send_to_intruder = Signal(object)
+    send_to_scanner = Signal(object)
     
     def __init__(self, proxy_thread: 'ProxyThread' = None):
         super().__init__()
@@ -303,14 +304,20 @@ class ProxyInterceptTab(QWidget):
                 self._on_item_selected(item)
         
         menu = QMenu(self)
+        copy_action = menu.addAction("复制选中行")
+        copy_action.setEnabled(row >= 0)
+        copy_action.triggered.connect(self._copy_selected_row)
+        menu.addSeparator()
         
         send_rep_action = menu.addAction("发送到 Repeater")
         send_int_action = menu.addAction("发送到 Intruder")
+        send_scan_action = menu.addAction("发送到扫描器")
         menu.addSeparator()
         forward_action = menu.addAction("放行 (Forward)")
         drop_action = menu.addAction("丢弃 (Drop)")
         send_rep_action.setEnabled(row >= 0)
         send_int_action.setEnabled(row >= 0)
+        send_scan_action.setEnabled(row >= 0)
         forward_action.setEnabled(row >= 0)
         drop_action.setEnabled(row >= 0)
         
@@ -320,10 +327,19 @@ class ProxyInterceptTab(QWidget):
             self._send_to_repeater()
         elif action == send_int_action:
             self._send_to_intruder()
+        elif action == send_scan_action:
+            self._send_to_scanner()
         elif action == forward_action:
             self._forward()
         elif action == drop_action:
             self._drop()
+
+    def _copy_selected_row(self):
+        row = self.intercept_table.currentRow()
+        if row < 0:
+            return
+        text = "\t".join((self.intercept_table.item(row, c).text() if self.intercept_table.item(row, c) else "") for c in range(self.intercept_table.columnCount()))
+        QApplication.clipboard().setText(text)
     
     def _send_to_repeater(self):
         """发送到 Repeater"""
@@ -338,6 +354,11 @@ class ProxyInterceptTab(QWidget):
         if row >= 0 and row < len(self.intercepted_list):
             req = self.intercepted_list[row]
             self.send_to_intruder.emit(req.to_dict())
+
+    def _send_to_scanner(self):
+        row = self.intercept_table.currentRow()
+        if 0 <= row < len(self.intercepted_list):
+            self.send_to_scanner.emit(self.intercepted_list[row].to_dict())
     
     def _forward(self):
         """放行请求 - 【修复】自动选择下一个请求"""
@@ -486,5 +507,3 @@ class ProxyInterceptTab(QWidget):
         self.forward_btn.setEnabled(False)
         self.drop_btn.setEnabled(False)
         self.forward_all_btn.setEnabled(False)
-
-

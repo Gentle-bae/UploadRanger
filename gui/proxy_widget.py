@@ -42,6 +42,7 @@ class ProxyWidget(QWidget):
 
     send_to_repeater = Signal(object)
     send_to_intruder = Signal(object)
+    send_to_scanner = Signal(object)
 
     def __init__(self):
         super().__init__()
@@ -116,11 +117,13 @@ class ProxyWidget(QWidget):
         self.intercept_tab = ProxyInterceptTab(None)
         self.intercept_tab.send_to_repeater.connect(self._on_send_to_repeater)
         self.intercept_tab.send_to_intruder.connect(self._on_send_to_intruder)
+        self.intercept_tab.send_to_scanner.connect(self._on_send_to_scanner)
         self.tabs.addTab(self.intercept_tab, "拦截")
 
         self.history_tab = ProxyHistoryTab(None, self.config_manager)
         self.history_tab.send_to_repeater.connect(self._on_send_to_repeater)
         self.history_tab.send_to_intruder.connect(self._on_send_to_intruder)
+        self.history_tab.send_to_scanner.connect(self._on_send_to_scanner)
         self.tabs.addTab(self.history_tab, "历史")
 
         layout.addWidget(self.tabs)
@@ -236,6 +239,9 @@ class ProxyWidget(QWidget):
 
     def _on_send_to_intruder(self, request_data):
         self.send_to_intruder.emit(request_data)
+
+    def _on_send_to_scanner(self, request_data):
+        self.send_to_scanner.emit(request_data)
 
     # ------------------------------------------------------------------
     # 配置

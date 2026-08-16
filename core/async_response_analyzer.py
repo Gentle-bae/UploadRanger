@@ -20,7 +20,7 @@ from .models import (
 class ScanHttpResponse:
     """与 httpx.Response 分析所需字段对齐，供 RawHTTPClient 等复用同一套判定逻辑。"""
 
-    __slots__ = ("status_code", "_text", "content", "headers", "request")
+    __slots__ = ("status_code", "_text", "content", "headers", "request", "raw_request")
 
     def __init__(
         self,
@@ -35,6 +35,7 @@ class ScanHttpResponse:
         self.content = content
         self.headers = headers
         self.request = type("Req", (), {"url": request_url})()
+        self.raw_request = b""
 
     @property
     def text(self) -> str:
@@ -45,13 +46,15 @@ class ScanHttpResponse:
 
 
 def wrap_raw_response(raw: RawHTTPResponse, request_url: str) -> ScanHttpResponse:
-    return ScanHttpResponse(
+    response = ScanHttpResponse(
         raw.status_code,
         raw.text,
         raw.content,
         dict(raw.headers),
         request_url,
     )
+    response.raw_request = getattr(raw, "raw_request", b"") or b""
+    return response
 
 
 class AsyncResponseAnalyzer:
@@ -321,7 +324,6 @@ class AsyncResponseAnalyzer:
                 
                 # 【修复】upload-labs场景：只要提取到upload目录下的文件资源，就视为强成功证据
                 if not has_strong_failure and (is_upload_path or _path_is_current):
-                    has_strong_success = True
                     score += 20
                     reasons.append("页面直接引用上传文件资源")
                     # 【新增】upload-labs特化识别
@@ -350,11 +352,7 @@ class AsyncResponseAnalyzer:
         
         # 7. 冲突裁决（强证据优先）
         # 【修复】upload-labs场景：只要有上传目录文件路径证据，即使分数略低也判定成功
-        is_upload_lab_success = (
-            result.get("path_leaked") and 
-            "/upload" in result.get("path_leaked", "").lower() and
-            not has_strong_failure
-        )
+        is_upload_lab_success = False
         
         if has_strong_success and not has_strong_failure:
             result["is_success"] = True

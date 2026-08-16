@@ -23,13 +23,16 @@ class AsyncHTTPClient:
                  proxies: Optional[Dict] = None, 
                  headers: Optional[Dict] = None, 
                  cookies: Optional[Dict] = None,
-                 timeout: int = DEFAULT_TIMEOUT):
+                 timeout: int = DEFAULT_TIMEOUT,
+                 verify_ssl: bool = True):
         
         self.proxies = proxies
         self.headers = headers or {}
         self.cookies = cookies or {}
         self.timeout = timeout
+        self.verify_ssl = verify_ssl
         self.log_callback: Optional[Callable[[TrafficLog], None]] = None
+        self.last_traffic_log: Optional[TrafficLog] = None
         self.request_counter = 0
         
         # 存储请求体用于日志
@@ -49,7 +52,7 @@ class AsyncHTTPClient:
             headers=self.headers,
             cookies=self.cookies,
             timeout=timeout,
-            verify=False,
+            verify=verify_ssl,
             trust_env=False,
             mounts=mounts if mounts else None
         )
@@ -57,6 +60,13 @@ class AsyncHTTPClient:
     def set_log_callback(self, callback: Callable[[TrafficLog], None]):
         """设置流量日志回调"""
         self.log_callback = callback
+
+    async def request(self, method: str, url: str, *, headers: Optional[Dict] = None,
+                      content: bytes = b"", follow_redirects: bool = False) -> httpx.Response:
+        response = await self.client.request(method.upper(), url, headers=headers,
+                                              content=content, follow_redirects=follow_redirects)
+        self._log_traffic(response, content)
+        return response
     
     def _format_request_body(self, content: bytes) -> str:
         """格式化请求体 - 尝试多种解码方式，显示完整内容"""
@@ -127,7 +137,7 @@ class AsyncHTTPClient:
         
         return ""
     
-    def _log_traffic(self, response: httpx.Response, request_body: bytes = b""):
+    def _log_traffic(self, response: httpx.Response, request_body: bytes = b"") -> Optional[TrafficLog]:
         """记录流量日志"""
         if self.log_callback:
             self.request_counter += 1
@@ -151,9 +161,18 @@ class AsyncHTTPClient:
                 request_headers=req_headers,
                 request_body=req_body,
                 response_headers=res_headers,
-                response_body=res_body
+                response_body=res_body,
+                response_body_bytes=response.content or b"",
+                request_raw=(
+                    f"{response.request.method} {response.request.url.raw_path.decode('ascii', errors='replace')} HTTP/1.1\r\n".encode("latin-1")
+                    + "\r\n".join(f"{k}: {v}" for k, v in response.request.headers.items()).encode("latin-1", errors="replace")
+                    + b"\r\n\r\n" + request_body
+                ),
             )
+            self.last_traffic_log = log
             self.log_callback(log)
+            return log
+        return None
     
     async def upload_file(self, 
                           url: str, 

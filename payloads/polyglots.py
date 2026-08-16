@@ -255,6 +255,12 @@ class PolyglotGenerator:
                 "extension": ".php",
                 "description": "PHP文件前添加JPG魔术字节"
             },
+            "magic_pdf": {
+                "name": "PDF魔术字节+PHP",
+                "generator": lambda: self.create_php_with_magic_bytes(php_code, "pdf"),
+                "extension": ".pdf.php",
+                "description": "PHP 文件前添加 PDF 签名，用于测试签名与扩展名组合校验"
+            },
             "svg_xss": {
                 "name": "SVG XSS",
                 "generator": lambda: self.create_svg_xss("alert('XSS')"),

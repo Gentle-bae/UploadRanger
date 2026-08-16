@@ -56,6 +56,7 @@ class TrafficViewer(QWidget):
     # 信号
     send_to_repeater = Signal(dict)  # 发送到Repeater
     send_to_intruder = Signal(dict)  # 发送到Intruder
+    send_to_scanner = Signal(dict)
     
     def __init__(self):
         super().__init__()
@@ -85,7 +86,7 @@ class TrafficViewer(QWidget):
         
         # 【新增】跳转到成功项按钮
         jump_success_btn = QPushButton("跳转到成功项")
-        jump_success_btn.setFixedWidth(100)
+        jump_success_btn.setFixedSize(104, 32)
         jump_success_btn.setToolTip("自动跳转到下一个成功的请求")
         jump_success_btn.setStyleSheet(f"""
             QPushButton {{
@@ -226,6 +227,14 @@ class TrafficViewer(QWidget):
             }}
         """)
         req_header.addWidget(self.intruder_btn)
+
+        self.scanner_btn = QPushButton("发送到扫描器")
+        self.scanner_btn.setFixedWidth(130)
+        self.scanner_btn.clicked.connect(self._send_to_scanner)
+        self.scanner_btn.setEnabled(False)
+        self.scanner_btn.setToolTip("使用当前请求作为扫描入口")
+        self.scanner_btn.setStyleSheet(f"QPushButton {{ background-color: {COLORS['success']}; color: white; border: none; padding: 5px 10px; border-radius: 4px; }} QPushButton:hover {{ background-color: #45a049; }}")
+        req_header.addWidget(self.scanner_btn)
         
         req_layout.addLayout(req_header)
         
@@ -278,7 +287,16 @@ class TrafficViewer(QWidget):
     
     def show_context_menu(self, position):
         """显示右键菜单"""
+        item = self.table.itemAt(position)
+        if item is not None:
+            self.table.selectRow(item.row())
+            self.display_details(item)
         menu = QMenu(self)
+        copy_action = QAction("复制选中行", self)
+        copy_action.setEnabled(bool(self.table.selectedItems()))
+        copy_action.triggered.connect(self._copy_selected_rows)
+        menu.addAction(copy_action)
+        menu.addSeparator()
         
         send_repeater_action = QAction("发送到 Repeater", self)
         send_repeater_action.triggered.connect(self._send_to_repeater)
@@ -287,6 +305,9 @@ class TrafficViewer(QWidget):
         send_intruder_action = QAction("发送到 Intruder", self)
         send_intruder_action.triggered.connect(self._send_to_intruder)
         menu.addAction(send_intruder_action)
+        send_scanner_action = QAction("发送到扫描器", self)
+        send_scanner_action.triggered.connect(self._send_to_scanner)
+        menu.addAction(send_scanner_action)
         
         menu.addSeparator()
         
@@ -295,6 +316,11 @@ class TrafficViewer(QWidget):
         menu.addAction(copy_url_action)
         
         menu.exec(self.table.viewport().mapToGlobal(position))
+
+    def _copy_selected_rows(self):
+        rows = sorted({i.row() for i in self.table.selectedItems()})
+        text = "\n".join("\t".join((self.table.item(r, c).text() if self.table.item(r, c) else "") for c in range(self.table.columnCount())) for r in rows)
+        QApplication.clipboard().setText(text)
     
     def _send_to_repeater(self):
         """发送到Repeater"""
@@ -315,6 +341,12 @@ class TrafficViewer(QWidget):
             if 'request_body' not in request_data:
                 request_data['request_body'] = getattr(self.current_log, 'request_body', '')
             self.send_to_intruder.emit(request_data)
+
+    def _send_to_scanner(self):
+        if self.current_log:
+            data = self.current_log.to_dict()
+            data.setdefault('request_body', getattr(self.current_log, 'request_body', '') or '')
+            self.send_to_scanner.emit(data)
     
     def _copy_url(self):
         """复制URL"""
@@ -331,6 +363,7 @@ class TrafficViewer(QWidget):
         self.current_log = None
         self.repeater_btn.setEnabled(False)
         self.intruder_btn.setEnabled(False)
+        self.scanner_btn.setEnabled(False)
         self.status_label.setText("")
     
     def add_log(self, log):
@@ -414,6 +447,7 @@ class TrafficViewer(QWidget):
             self.current_log = log
             self.repeater_btn.setEnabled(True)
             self.intruder_btn.setEnabled(True)
+            self.scanner_btn.setEnabled(True)
             
             # 格式化请求 - 显示完整内容
             req_str = ""
@@ -423,13 +457,27 @@ class TrafficViewer(QWidget):
             req_str += f"{log.request_body}"
             self.req_text.setPlainText(req_str)
             
+            # 扫描器对 302 会生成带 parent_log_id 的跟随请求。选择 302 时，
+            # Render 默认展示最终响应，同时在 Raw 顶部保留完整跳转链。
+            render_log = log
+            redirect_chain = []
+            if 300 <= log.status_code < 400:
+                redirect_chain.append({'status_code': log.status_code, 'url': log.url, 'location': ''})
+                for candidate in self.logs:
+                    if getattr(candidate, 'parent_log_id', None) == log.id:
+                        render_log = candidate
+                        redirect_chain.append({'status_code': candidate.status_code, 'url': candidate.url, 'location': ''})
+                        break
+
             # 构建响应数据字典
             response_data = {
-                'status_code': log.status_code,
-                'headers': log.response_headers,
-                'body': log.response_body,
-                'body_bytes': log.response_body.encode('utf-8', errors='replace') if isinstance(log.response_body, str) else b'',
-                'url': log.url
+                'status_code': render_log.status_code,
+                'headers': render_log.response_headers,
+                'body': render_log.response_body,
+                'body_bytes': getattr(render_log, 'response_body_bytes', b'') or (render_log.response_body.encode('utf-8', errors='replace') if isinstance(render_log.response_body, str) else b''),
+                'url': render_log.url,
+                'follow_redirects': len(redirect_chain) > 1,
+                'redirect_chain': redirect_chain,
             }
             self.res_viewer.set_response_from_dict(response_data)
             
@@ -439,7 +487,7 @@ class TrafficViewer(QWidget):
                 status_text += " OK"
                 color = COLORS['success']
             elif 300 <= log.status_code < 400:
-                status_text += " Redirect"
+                status_text += f" Redirect → {render_log.status_code}" if render_log is not log else " Redirect"
                 color = COLORS['warning']
             elif 400 <= log.status_code < 500:
                 status_text += " Client Error"

@@ -10,6 +10,14 @@ import subprocess
 import shutil
 from PIL import Image
 
+
+MCP_HIDDEN_IMPORTS = [
+    '--hidden-import', 'mcp',
+    '--hidden-import', 'mcp.server.fastmcp',
+    '--hidden-import', 'core.mcp',
+    '--hidden-import', 'core.mcp.server',
+]
+
 # 添加调试输出
 print(f"[DEBUG] 当前Python: {sys.executable}")
 print(f"[DEBUG] 当前工作目录: {os.getcwd()}")
@@ -64,7 +72,12 @@ def convert_png_to_ico(png_path, ico_path=None):
             print(f"  转换模式: {img.mode}")
         
         # 保存为ICO
-        img.save(ico_path, format='ICO')
+        img.save(
+            ico_path,
+            format='ICO',
+            sizes=[(16, 16), (24, 24), (32, 32), (48, 48),
+                   (64, 64), (128, 128), (256, 256)],
+        )
         print(f"[OK] 已将 {os.path.basename(png_path)} 转换为 {os.path.basename(ico_path)}")
         
         # 验证文件是否创建
@@ -131,6 +144,7 @@ def build_exe():
         '--onefile',
         '--clean',
         '--noconfirm',
+        '--noupx',
     ]
     
     # 添加图标（必须是ICO格式）
@@ -141,11 +155,8 @@ def build_exe():
     import platform
     sep = ';' if platform.system() == 'Windows' else ':'
     cmd.extend([
-        f'--add-data=payloads{sep}payloads',
-        f'--add-data=core{sep}core',
-        f'--add-data=gui{sep}gui',
         f'--add-data=assets{sep}assets',
-        f'--add-data=config.py{sep}.',
+        f'--add-data=img{sep}img',
     ])
     
     # 隐藏导入
@@ -165,6 +176,7 @@ def build_exe():
         '--hidden-import', 'pyparsing',
         '--hidden-import', 'blinker',
     ])
+    cmd.extend(MCP_HIDDEN_IMPORTS)
     
     # 排除冲突的Qt包
     cmd.extend([
@@ -242,10 +254,23 @@ def build_directory():
         '--windowed',
         '--clean',
         '--noconfirm',
+        '--noupx',
     ]
     
     if final_icon and os.path.exists(final_icon):
         cmd.append(f'--icon={final_icon}')
+
+    # 目录版运行时同样通过 ``sys._MEIPASS`` 查找资源；仅在构建
+    # 完成后复制到 EXE 同级目录会导致图片和图标无法被运行中的程序
+    # 稳定定位。因此与单文件版保持一致，交由 PyInstaller 收集。
+    import platform
+    sep = ';' if platform.system() == 'Windows' else ':'
+    cmd.extend([
+        f'--add-data=assets{sep}assets',
+        f'--add-data=img{sep}img',
+        f'--add-data=README.md{sep}.',
+        f'--add-data=requirements.txt{sep}.',
+    ])
     
     # 隐藏导入
     cmd.extend([
@@ -264,6 +289,9 @@ def build_directory():
         '--hidden-import', 'pyparsing',
         '--hidden-import', 'blinker',
     ])
+    # 目录版和单文件版必须拥有同一套 MCP 依赖；否则 EXE 的
+    # ``--mcp-server`` 入口会在目录版中因缺少动态导入而失败。
+    cmd.extend(MCP_HIDDEN_IMPORTS)
     
     # 排除冲突的Qt包
     cmd.extend([
@@ -283,7 +311,7 @@ def build_directory():
         dist_dir = os.path.join('dist', 'UploadRanger')
         
         # 复制目录
-        for dir_name in ['payloads', 'core', 'gui', 'assets']:
+        for dir_name in ['payloads', 'core', 'gui', 'assets', 'img']:
             if os.path.exists(dir_name):
                 dst = os.path.join(dist_dir, dir_name)
                 if os.path.exists(dst):
@@ -309,11 +337,14 @@ def build_directory():
 
 if __name__ == '__main__':
     import argparse
+    # 显式目录版参数；不传模式参数时仍默认构建目录版。
+    parser_directory_help = '打包为目录版 EXE（启动更快）'
     
     parser = argparse.ArgumentParser(description='UploadRanger打包工具')
     parser.add_argument('--onefile', action='store_true', help='打包为单文件')
     parser.add_argument('--clean', action='store_true', help='仅清理构建文件')
     
+    parser.add_argument('--directory', '--onedir', dest='directory', action='store_true', help=parser_directory_help)
     args = parser.parse_args()
     
     print(f"[DEBUG] 解析参数: onefile={args.onefile}, clean={args.clean}")

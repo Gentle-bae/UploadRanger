@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主窗口 - UploadRanger GUI主界面 v1.1.1
+主窗口 - UploadRanger GUI主界面 v1.2.0
 整合upload_forge功能，添加请求/响应查看、Repeater和Intruder功能
 """
 
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QRadioButton, QButtonGroup,
 )
 from PySide6.QtCore import Qt, QSize, QTimer, QObject, Signal
+from PySide6.QtGui import QKeySequence
 from PySide6.QtGui import QColor, QFont, QIcon, QAction
 import webbrowser
 
@@ -36,6 +37,7 @@ from .repeater_widget import RepeaterWidget
 from .intruder_widget import IntruderWidget
 from .syntax_highlighter import HTTPHighlighter, WebShellHighlighter
 from .wizard_widget import QuickScanWizard
+from .mcp_widget import MCPPanel
 
 
 # 导入核心模块
@@ -54,6 +56,8 @@ from payloads.webshells import WebShellGenerator
 from payloads.bypass_payloads import BypassPayloadGenerator
 from payloads.polyglots import PolyglotGenerator
 from core.models import VulnerabilityFinding, RISK_CRITICAL, RISK_HIGH, RISK_MEDIUM
+from core.request_parser import parse_raw_request
+from core.magic_bytes import build_magic_content, detect_signature, signatures_for_ui
 
 GITHUB_API_URL = "https://api.github.com/repos/Gentle-bae/UploadRanger/releases/latest"
 GITHUB_REPO_URL = "https://github.com/Gentle-bae/UploadRanger"
@@ -319,7 +323,122 @@ class WebShellSettingsDialog(QDialog):
         }
 
 
-class ResultsTable(QTableWidget):
+class CustomPayloadDialog(QDialog):
+    """编辑主扫描器使用的自定义上传 Payload。"""
+
+    def __init__(self, parent=None, payloads=None):
+        super().__init__(parent)
+        self.setWindowTitle("自定义 Payload")
+        self.resize(620, 460)
+        self._payloads = [dict(p) for p in (payloads or [])]
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.filename_input = QLineEdit("custom.php")
+        self.mime_input = QLineEdit("application/octet-stream")
+        self.content_input = QPlainTextEdit()
+        self.content_input.setPlaceholderText("上传内容（按 UTF-8 编码；二进制请通过 API 传入 bytes）")
+        form.addRow("名称:", self.name_input)
+        form.addRow("文件名:", self.filename_input)
+        form.addRow("Content-Type:", self.mime_input)
+        form.addRow("内容:", self.content_input)
+        layout.addLayout(form)
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+        for item in self._payloads:
+            self._append_list_item(item)
+        row = QHBoxLayout()
+        add_btn = QPushButton("添加/更新")
+        remove_btn = QPushButton("删除选中")
+        add_btn.clicked.connect(self._add_payload)
+        remove_btn.clicked.connect(self._remove_payload)
+        row.addWidget(add_btn)
+        row.addWidget(remove_btn)
+        row.addStretch()
+        layout.addLayout(row)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        ok_btn = QPushButton("确定")
+        cancel_btn = QPushButton("取消")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        self.list_widget.currentRowChanged.connect(self._load_row)
+
+    def _append_list_item(self, payload):
+        self.list_widget.addItem(f"{payload.get('name') or payload.get('filename')}  [{payload.get('filename')}]")
+
+    def _add_payload(self):
+        filename = self.filename_input.text().strip() or "custom.bin"
+        item = {
+            "name": self.name_input.text().strip() or filename,
+            "filename": filename,
+            "content_type": self.mime_input.text().strip() or "application/octet-stream",
+            "content": self.content_input.toPlainText(),
+            "enabled": True,
+            "priority": 100,
+        }
+        row = self.list_widget.currentRow()
+        if row >= 0:
+            self._payloads[row] = item
+            self.list_widget.item(row).setText(f"{item['name']}  [{filename}]")
+        else:
+            self._payloads.append(item)
+            self._append_list_item(item)
+        self.name_input.clear()
+        self.content_input.clear()
+        self.list_widget.clearSelection()
+
+    def _remove_payload(self):
+        row = self.list_widget.currentRow()
+        if row >= 0:
+            self.list_widget.takeItem(row)
+            self._payloads.pop(row)
+
+    def _load_row(self, row):
+        if row < 0 or row >= len(self._payloads):
+            return
+        item = self._payloads[row]
+        self.name_input.setText(str(item.get("name") or ""))
+        self.filename_input.setText(str(item.get("filename") or "custom.bin"))
+        self.mime_input.setText(str(item.get("content_type") or "application/octet-stream"))
+        content = item.get("content", b"")
+        self.content_input.setPlainText(content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content))
+
+    def get_payloads(self):
+        return [dict(p) for p in self._payloads]
+
+
+class CopyableTableWidget(QTableWidget):
+    """支持复制选中行/单元格的通用表格。"""
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selection()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selection(self):
+        ranges = self.selectedRanges()
+        if not ranges:
+            return
+        rows = sorted({row for r in ranges for row in range(r.topRow(), r.bottomRow() + 1)})
+        cols = sorted({col for r in ranges for col in range(r.leftColumn(), r.rightColumn() + 1)})
+        if self.selectionBehavior() == QTableWidget.SelectionBehavior.SelectRows:
+            cols = list(range(self.columnCount()))
+        text = "\n".join("\t".join((self.item(row, col).text() if self.item(row, col) else "") for col in cols) for row in rows)
+        QApplication.clipboard().setText(text)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        action = menu.addAction("复制选中内容")
+        action.setEnabled(bool(self.selectedRanges()))
+        action.triggered.connect(self.copy_selection)
+        menu.exec(event.globalPos())
+
+
+class ResultsTable(CopyableTableWidget):
     """扫描结果表格 - 显示所有测试结果"""
     
     # 信号定义 - 用于发送到Repeater/Intruder/Diff
@@ -423,6 +542,11 @@ class ResultsTable(QTableWidget):
         # 第2列：状态码
         status_code = result.get('status_code', 0)
         status_item = QTableWidgetItem(str(status_code))
+        verification_url = result.get('verification_url') or ''
+        if verification_url:
+            status_item.setToolTip(f"上传直接响应: HTTP {status_code}\n文件验证 URL: {verification_url}\n验证状态: 已通过")
+        elif result.get('is_redirect') or 300 <= status_code < 400:
+            status_item.setToolTip("上传接口返回重定向；仅凭 3xx 不判定成功，需文件访问验证")
         if 200 <= status_code < 300:
             status_item.setForeground(QColor(COLORS['success']))
         elif 300 <= status_code < 400:
@@ -433,7 +557,10 @@ class ResultsTable(QTableWidget):
             status_item.setForeground(QColor("#ff6b6b"))
         
         # 第3列：状态文本
-        status_text = "成功" if is_success else "失败"
+        verified_upload = bool(
+            result.get('verified_upload') or result.get('verified_execution') or result.get('verification_url')
+        )
+        status_text = "已验证" if verified_upload else ("待验证" if is_success else "失败")
         status_text_item = QTableWidgetItem(status_text)
         reasons = result.get('decision_reasons', []) or []
         if reasons:
@@ -456,9 +583,9 @@ class ResultsTable(QTableWidget):
         prob_item.setToolTip(f"置信度: {confidence_level}")
         
         # 【新增】第5列：验证状态
-        verification = result.get('verification', {})
+        verification = result.get('verification', {}) or {}
         verify_status = verification.get('status', 'N/A')
-        verify_verified = verification.get('verified', False)
+        verify_verified = bool(verification.get('verified', False) or verified_upload)
         
         if verify_verified:
             verify_text = "已验证"
@@ -483,6 +610,15 @@ class ResultsTable(QTableWidget):
             verify_tooltip += f"输出: {verification.get('execution_output', 'N/A')[:50]}"
         if verification.get('error'):
             verify_tooltip += f"错误: {verification.get('error')}"
+        attempts = result.get('verification_attempts', []) or []
+        if attempts:
+            verify_tooltip += "\n验证尝试:"
+            for attempt in attempts[:5]:
+                status = attempt.get('status_code', 'ERR')
+                evidence = "字节匹配" if attempt.get('content_match') else (
+                    "标记匹配" if attempt.get('marker_match') else "未匹配"
+                )
+                verify_tooltip += f"\n{status} {attempt.get('url', '')} ({evidence})"
         verify_item.setToolTip(verify_tooltip)
         
         # 第6列：路径
@@ -522,6 +658,10 @@ class ResultsTable(QTableWidget):
     def _show_context_menu(self, position):
         """显示右键菜单"""
         menu = QMenu(self)
+        copy_action = menu.addAction("复制选中内容")
+        copy_action.setEnabled(bool(self.selectedRanges()))
+        copy_action.triggered.connect(self.copy_selection)
+        menu.addSeparator()
         
         # 注意：扫描结果不提供 Repeater/Intruder 发送，因为请求响应数据不完整
         # 如需测试，请使用 Traffic 标签页中的完整请求
@@ -552,7 +692,7 @@ class ResultsTable(QTableWidget):
             self.send_to_intruder.emit(result)
 
 
-class FindingsTable(QTableWidget):
+class FindingsTable(CopyableTableWidget):
     """漏洞发现表格"""
     
     def __init__(self):
@@ -573,6 +713,7 @@ class FindingsTable(QTableWidget):
         self.setSelectionBehavior(QTableWidget.SelectRows)
         self.setEditTriggers(QTableWidget.NoEditTriggers)  # 【修复】禁用编辑
         self.setAlternatingRowColors(True)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
         
         # 【修复】添加表格样式，移除选中边框
         self.setStyleSheet(f"""
@@ -694,6 +835,11 @@ class MainWindow(QMainWindow):
         
         # 初始化组件
         self.worker = None
+        self._scan_stop_requested = False
+        self._scan_progress_current = 0
+        self._scan_progress_total = 0
+        self._scan_resume_index = 0
+        self._resume_requested = False
         self.shell_generator = WebShellGenerator()
         self.bypass_generator = BypassPayloadGenerator()
         self.polyglot_generator = PolyglotGenerator()
@@ -726,9 +872,13 @@ class MainWindow(QMainWindow):
     
     def _load_icon(self):
         """加载应用图标"""
-        icon_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "icon.png")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+        # Windows 任务栏优先使用 ICO；开发环境没有 ICO 时回退 PNG。
+        for filename in ("icon.ico", "icon.png"):
+            icon_path = os.path.join(assets_dir, filename)
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                break
 
     def _on_close_event(self, event):
         """窗口关闭前停止所有后台线程 - 修复卡顿问题"""
@@ -764,6 +914,9 @@ class MainWindow(QMainWindow):
                     pass
             
             # 3. 停止Repeater和Intruder中的worker - 【修复】强制终止
+            if hasattr(self, 'mcp_panel') and self.mcp_panel:
+                self.mcp_panel.shutdown()
+
             try:
                 if hasattr(self, 'repeater') and self.repeater:
                     for i in range(self.repeater.content_stack.count()):
@@ -946,6 +1099,7 @@ class MainWindow(QMainWindow):
             self._create_bypass_tab()
             self._create_polyglot_tab()
             self._create_logs_tab()
+            self._create_mcp_tab()
             self._create_about_tab()
             
             # 恢复之前的选中状态
@@ -1223,6 +1377,16 @@ class MainWindow(QMainWindow):
     def _get_scan_mode(self):
         """获取当前扫描模式"""
         return "penetration" if self.penetration_test_rb.isChecked() else "security"
+
+    def _get_strategy_mode(self):
+        combo = getattr(self, "strategy_mode_combo", None)
+        return combo.currentData() if combo is not None else "adaptive"
+
+    def _open_custom_payloads(self):
+        dialog = CustomPayloadDialog(self, self._custom_payloads)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._custom_payloads = dialog.get_payloads()
+            self._log(f"[Payload] 已配置 {len(self._custom_payloads)} 个自定义 Payload")
     
     def _get_webshell_config(self):
         """获取WebShell配置"""
@@ -1283,6 +1447,7 @@ class MainWindow(QMainWindow):
         
         # 日志标签
         self._create_logs_tab()
+        self._create_mcp_tab()
         
         # 关于标签
         self._create_about_tab()
@@ -1308,6 +1473,10 @@ class MainWindow(QMainWindow):
             print(f"[UploadRanger] {warning_msg}")
             if hasattr(self, 'log_text') and self.log_text:
                 self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {warning_msg}")
+
+    def _create_mcp_tab(self):
+        self.mcp_panel = MCPPanel(self)
+        self.tabs.addTab(self.mcp_panel, "MCP")
     
     def _on_tab_changed(self, index):
         """标签页切换事件"""
@@ -1329,6 +1498,8 @@ class MainWindow(QMainWindow):
         
         # 左侧配置面板
         left_panel = QWidget()
+        left_panel.setMinimumWidth(430)
+        left_panel.setMaximumWidth(470)
         left_panel.setFixedWidth(380)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -1420,14 +1591,40 @@ class MainWindow(QMainWindow):
         
         # WebShell设置按钮（仅渗透模式可用）
         self.webshell_settings_btn = QPushButton("Shell设置")
-        self.webshell_settings_btn.setFixedWidth(110)  # 修复按钮显示不全
+        self.webshell_settings_btn.setFixedSize(110, 32)
         self.webshell_settings_btn.setEnabled(False)
         self.webshell_settings_btn.setToolTip("设置WebShell密码和类型")
         self.webshell_settings_btn.clicked.connect(self._open_webshell_settings)
         mode_row.addWidget(self.webshell_settings_btn)
-        
         mode_row.addStretch()
         options_layout.addLayout(mode_row)
+
+        # 策略配置单独成行；不能和模式/Shell 控件挤在同一行。
+        strategy_row = QHBoxLayout()
+        strategy_row.addWidget(QLabel("扫描策略:"))
+        self.strategy_mode_combo = QComboBox()
+        self.strategy_mode_combo.addItem("自适应", "adaptive")
+        self.strategy_mode_combo.addItem("全量", "full")
+        self.strategy_mode_combo.addItem("仅自定义", "manual")
+        self.strategy_mode_combo.setToolTip("自适应结合服务器指纹排序；全量保留所有内置 Payload")
+        self.strategy_mode_combo.setFixedSize(112, 32)
+        self.strategy_mode_combo.setStyleSheet(f"""
+            QComboBox {{ background: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['accent']};
+                        border-radius: 5px; padding: 3px 8px; color: {COLORS['text_primary']}; }}
+            QComboBox::drop-down {{ border: 0; width: 22px; }}
+        """)
+        strategy_row.addWidget(self.strategy_mode_combo)
+        self.custom_payload_btn = QPushButton("自定义 Payload")
+        self.custom_payload_btn.setFixedSize(112, 32)
+        self.custom_payload_btn.setStyleSheet(f"""
+            QPushButton {{ background: {COLORS['bg_tertiary']}; border: 1px solid {COLORS['border']};
+                          border-radius: 5px; padding: 3px 8px; }}
+            QPushButton:hover {{ border-color: {COLORS['accent']}; background: {COLORS['bg_secondary']}; }}
+        """)
+        self.custom_payload_btn.clicked.connect(self._open_custom_payloads)
+        strategy_row.addWidget(self.custom_payload_btn)
+        strategy_row.addStretch()
+        options_layout.addLayout(strategy_row)
         
         # 连接模式切换信号
         self.security_test_rb.toggled.connect(self._on_scan_mode_changed)
@@ -1484,7 +1681,9 @@ class MainWindow(QMainWindow):
         
         # 初始化后缀选择器
         self._selected_extensions = None  # None表示全选
+        self._custom_payloads = []
         
+        self._custom_payloads = []
         left_layout.addWidget(options_group)
         
         # 控制按钮
@@ -1504,6 +1703,13 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_scan)
         btn_layout.addWidget(self.stop_btn)
+
+        self.resume_btn = QPushButton("继续扫描")
+        self.resume_btn.setFixedHeight(45)
+        self.resume_btn.setEnabled(False)
+        self.resume_btn.setToolTip("从上次停止的位置继续，不清空已有结果和流量")
+        self.resume_btn.clicked.connect(self._resume_scan)
+        btn_layout.addWidget(self.resume_btn)
         
         left_layout.addLayout(btn_layout)
         
@@ -1514,7 +1720,15 @@ class MainWindow(QMainWindow):
         
         self.progress_label = QLabel("就绪")
         self.progress_label.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        self.progress_label.setWordWrap(True)
+        self.progress_label.setMinimumHeight(24)
         left_layout.addWidget(self.progress_label)
+
+        self.scan_state_label = QLabel("计划: 0 | 已测: 0 | 跳过: 0 | 已验证: 0")
+        self.scan_state_label.setWordWrap(True)
+        self.scan_state_label.setMinimumHeight(30)
+        self.scan_state_label.setStyleSheet(f"color: {COLORS['accent']}; font-size: 12px;")
+        left_layout.addWidget(self.scan_state_label)
         
         left_layout.addStretch()
         
@@ -1525,6 +1739,7 @@ class MainWindow(QMainWindow):
         
         # 垂直分割器
         splitter = QSplitter(Qt.Vertical)
+        splitter.setChildrenCollapsible(False)
         
         # 上半部分: 扫描结果表格
         results_widget = QWidget()
@@ -1538,7 +1753,7 @@ class MainWindow(QMainWindow):
         
         # 【新增】跳转到成功响应按钮
         jump_success_btn = QPushButton("跳转到成功项")
-        jump_success_btn.setFixedWidth(100)
+        jump_success_btn.setFixedSize(104, 32)
         jump_success_btn.setToolTip("自动滚动到第一个成功的响应")
         jump_success_btn.setStyleSheet(f"""
             QPushButton {{
@@ -1556,7 +1771,7 @@ class MainWindow(QMainWindow):
         results_header.addWidget(jump_success_btn)
         
         clear_results_btn = QPushButton("清除")
-        clear_results_btn.setFixedWidth(80)
+        clear_results_btn.setFixedSize(104, 32)
         clear_results_btn.clicked.connect(self._clear_results)
         results_header.addWidget(clear_results_btn)
         
@@ -1581,7 +1796,7 @@ class MainWindow(QMainWindow):
         vulns_header.addWidget(vulns_label)
         
         clear_vulns_btn = QPushButton("清除")
-        clear_vulns_btn.setFixedWidth(80)
+        clear_vulns_btn.setFixedSize(104, 32)
         clear_vulns_btn.clicked.connect(self._clear_findings)
         vulns_header.addWidget(clear_vulns_btn)
         
@@ -1604,12 +1819,14 @@ class MainWindow(QMainWindow):
         splitter.addWidget(vulns_widget)
         
         # 设置分割器比例
-        splitter.setSizes([350, 450])
+        results_widget.setMinimumHeight(260)
+        vulns_widget.setMinimumHeight(330)
+        splitter.setSizes([360, 440])
         
         right_layout.addWidget(splitter)
         
-        layout.addWidget(left_panel)
-        layout.addWidget(right_panel)
+        layout.addWidget(left_panel, 0)
+        layout.addWidget(right_panel, 1)
         
         self.tabs.addTab(scan_tab, "扫描")
     
@@ -1618,12 +1835,15 @@ class MainWindow(QMainWindow):
         self.traffic_viewer = TrafficViewer()
         self.traffic_viewer.send_to_repeater.connect(self._load_to_repeater)
         self.traffic_viewer.send_to_intruder.connect(self._load_to_intruder)
+        self.traffic_viewer.send_to_scanner.connect(self._start_scan_from_request)
         self.tabs.addTab(self.traffic_viewer, "请求/响应")
     
     def _create_repeater_tab(self):
         """创建Repeater标签页 - 修复版本"""
         try:
             self.repeater = RepeaterWidget()
+            self.repeater.send_to_scanner.connect(self._start_scan_from_request)
+            self.repeater.send_to_intruder.connect(self._load_to_intruder)
             self.tabs.addTab(self.repeater, "Repeater")
             # 延迟日志记录，确保不会干扰创建过程
             QTimer.singleShot(100, lambda: self._log("已创建Repeater标签页"))
@@ -1677,6 +1897,20 @@ class MainWindow(QMainWindow):
         self.payload_type_combo = QComboBox()
         self.payload_type_combo.setMinimumWidth(200)
         control_layout.addWidget(self.payload_type_combo)
+        control_layout.addWidget(QLabel("自定义密码:"))
+        self.payload_password = QLineEdit()
+        self.payload_password.setPlaceholderText("可选，留空使用随机密码")
+        self.payload_password.setEchoMode(QLineEdit.EchoMode.Normal)
+        self.payload_password.setMinimumWidth(150)
+        control_layout.addWidget(self.payload_password)
+        self.payload_password_hint = QLabel("当前: 随机")
+        self.payload_password_hint.setObjectName("subtitle")
+        control_layout.addWidget(self.payload_password_hint)
+        self.payload_password.textChanged.connect(
+            lambda value: self.payload_password_hint.setText(
+                "当前: " + (value if value else "随机")
+            )
+        )
         
         control_layout.addStretch()
         
@@ -1739,7 +1973,7 @@ class MainWindow(QMainWindow):
         
         layout.addLayout(input_layout)
         
-        self.bypass_table = QTableWidget()
+        self.bypass_table = CopyableTableWidget()
         self.bypass_table.setColumnCount(4)
         self.bypass_table.setHorizontalHeaderLabels(["文件名", "技术", "严重程度", "描述"])
         self.bypass_table.setColumnWidth(0, 250)
@@ -1748,6 +1982,17 @@ class MainWindow(QMainWindow):
         self.bypass_table.horizontalHeader().setStretchLastSection(True)
         self.bypass_table.verticalHeader().setVisible(False)
         self.bypass_table.setAlternatingRowColors(True)
+        # 绕过技术表支持单元格、整行和整列选择；之前固定 SelectRows，
+        # 导致用户无法一次复制某一列。
+        self.bypass_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self.bypass_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.bypass_table.horizontalHeader().sectionClicked.connect(
+            lambda section: self.bypass_table.selectColumn(section)
+        )
+        self.bypass_table.verticalHeader().sectionClicked.connect(
+            lambda section: self.bypass_table.selectRow(section)
+        )
+        self.bypass_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         
         # 设置选中样式，防止边框覆盖文字
         self.bypass_table.setStyleSheet(f"""
@@ -1831,17 +2076,70 @@ class MainWindow(QMainWindow):
         preview_layout.addWidget(self.polyglot_preview)
         
         layout.addWidget(preview_group)
+
+        magic_group = QGroupBox("文件签名 / Magic Bytes")
+        magic_layout = QVBoxLayout(magic_group)
+        magic_controls = QHBoxLayout()
+        magic_controls.addWidget(QLabel("签名:"))
+        self.magic_type = QComboBox()
+        for key in signatures_for_ui():
+            self.magic_type.addItem(key.upper(), key)
+        magic_controls.addWidget(self.magic_type)
+        magic_controls.addWidget(QLabel("自定义 Hex:"))
+        self.magic_hex = QLineEdit()
+        self.magic_hex.setPlaceholderText("可选，例如 89 50 4E 47 0D 0A 1A 0A")
+        magic_controls.addWidget(self.magic_hex, 1)
+        magic_generate = QPushButton("生成签名内容")
+        magic_generate.clicked.connect(self._generate_magic_bytes)
+        magic_controls.addWidget(magic_generate)
+        magic_layout.addLayout(magic_controls)
+        self.magic_payload = QPlainTextEdit()
+        self.magic_payload.setPlaceholderText("可选：追加测试内容（UTF-8 文本）")
+        self.magic_payload.setMaximumHeight(70)
+        magic_layout.addWidget(self.magic_payload)
+        self.magic_preview = QPlainTextEdit()
+        self.magic_preview.setReadOnly(True)
+        self.magic_preview.setFont(QFont("Consolas", 10))
+        self.magic_preview.setPlaceholderText("生成后显示 Hex 预览、字节长度和识别结果")
+        magic_layout.addWidget(self.magic_preview)
+        note = QLabel("说明：魔法字节只影响文件内容开头，不等于服务器接受或执行；最终以响应分析和文件访问验证为准。")
+        note.setObjectName("subtitle")
+        note.setWordWrap(True)
+        magic_layout.addWidget(note)
+        layout.addWidget(magic_group)
         
         self.polyglot_data = None
         self.polyglot_ext = None
         
         self.tabs.addTab(polyglot_tab, "Polyglot")
+
+    def _generate_magic_bytes(self):
+        """生成并预览统一 Magic Bytes 内容。"""
+        try:
+            custom = self.magic_hex.text().strip()
+            if custom:
+                signature = bytes.fromhex(custom.replace(",", " "))
+            else:
+                signature = signatures_for_ui()[self.magic_type.currentData()]
+            payload = self.magic_payload.toPlainText().encode("utf-8")
+            data = build_magic_content(signature, payload)
+            detected = detect_signature(data)
+            detected_text = detected[0].upper() if detected else "未知"
+            hex_preview = " ".join(f"{b:02X}" for b in data[:256])
+            suffix = " ..." if len(data) > 256 else ""
+            self.magic_preview.setPlainText(
+                f"长度: {len(data)} bytes\n识别: {detected_text}\nHex:\n{hex_preview}{suffix}"
+            )
+            self.magic_data = data
+        except (ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Magic Bytes", f"输入无效：{exc}")
     
     def _create_proxy_tab(self):
         """创建代理标签页"""
         self.proxy_widget = ProxyWidget()
         self.proxy_widget.send_to_repeater.connect(self._load_to_repeater)
         self.proxy_widget.send_to_intruder.connect(self._load_to_intruder)
+        self.proxy_widget.send_to_scanner.connect(self._start_scan_from_request)
         self.tabs.addTab(self.proxy_widget, "代理")
     
     def _create_logs_tab(self):
@@ -1868,96 +2166,43 @@ class MainWindow(QMainWindow):
             self._pending_logs.clear()
     
     def _create_about_tab(self):
-        """创建关于标签页"""
+        """创建紧凑、可滚动的关于页，避免小窗口下内容挤压。"""
         about_tab = QWidget()
-        layout = QVBoxLayout(about_tab)
-        layout.setAlignment(Qt.AlignCenter)
-        
-        container = QWidget()
-        container.setFixedWidth(600)
-        container_layout = QVBoxLayout(container)
-        container_layout.setSpacing(20)
-        
-        title = QLabel("UploadRanger")
-        title.setStyleSheet(f"font-size: 36px; font-weight: bold; color: {COLORS['accent']};")
-        title.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(title)
-        
-        version = QLabel(f"版本 v{CURRENT_VERSION}")
-        version.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 14px;")
-        version.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(version)
-        
-        desc = QLabel(
-            "UploadRanger 是一款现代化的文件上传漏洞测试工具，\n"
-            "专为渗透测试人员和安全研究人员设计。"
-        )
-        desc.setStyleSheet(f"color: {COLORS['text_primary']}; font-size: 14px;")
-        desc.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(desc)
-        
-        features = QLabel(
-            "<b>功能特性：</b><br>"
-            "• 异步扫描 + 可选 Raw 字节级 multipart（与同步引擎对齐）<br>"
-            "• 环境指纹预检与 Payload 策略过滤/排序（可选）<br>"
-            "• 请求/响应实时查看 (Burp 风格，带语法高亮)<br>"
-            "• Repeater 重放 / Intruder 多模式爆破<br>"
-            "• 37+ 种绕过技术测试（生成器页）<br>"
-            "• 23 种 WebShell 生成 (PHP/ASP/JSP/Python/Perl)<br>"
-            "• 8 种 Polyglot 文件<br>"
-            "• 快速向导、GitHub 检查更新<br>"
-            "• 结构化 JSON 上传响应判定与可解释原因"
-        )
-        features.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 13px; line-height: 1.8;")
-        features.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(features)
-        
-        # 浏览器配置说明
-        browser_config = QLabel(
-            "<b>浏览器配置说明（抓取localhost/127.0.0.1必需）：</b><br>"
-            "<b>Chrome/Edge:</b> 启动参数添加 --proxy-bypass-list='&lt;-loopback&gt;'<br>"
-            "<b>Firefox:</b> about:config → network.proxy.allow_hijacking_localhost = true<br>"
-            "<b>Zero Omega:</b> '不代理的地址列表'必须清空"
-        )
-        browser_config.setStyleSheet(f"color: {COLORS['warning']}; font-size: 12px; line-height: 1.6;")
-        browser_config.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(browser_config)
-        
-        author = QLabel("作者: bae")
-        author.setStyleSheet(f"color: {COLORS['accent']}; font-size: 14px;")
-        author.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(author)
-        
-        warning = QLabel(
-            "<b>警告：</b>本工具仅供安全测试使用，<br>"
-            "请遵守相关法律法规，仅在授权的系统上使用。"
-        )
-        warning.setStyleSheet(f"color: {COLORS['danger']}; font-size: 12px;")
-        warning.setAlignment(Qt.AlignCenter)
-        container_layout.addWidget(warning)
-        
-        # 添加界面重置按钮
-        reset_btn = QPushButton("重置界面")
-        reset_btn.setToolTip("如果Repeater或Intruder标签页消失，点击此按钮恢复")
-        reset_btn.setFixedWidth(120)
-        reset_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {COLORS['warning']};
-                color: white;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background-color: {COLORS['accent']};
-            }}
-        """)
-        reset_btn.clicked.connect(self.reset_tabs)
-        container_layout.addWidget(reset_btn)
-        
-        layout.addWidget(container)
-        
+        outer = QVBoxLayout(about_tab)
+        outer.setContentsMargins(12, 12, 12, 12)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget(); grid = QVBoxLayout(content); grid.setContentsMargins(8, 8, 8, 8); grid.setSpacing(12)
+
+        hero = QFrame(); hero.setObjectName("aboutHero")
+        hero.setStyleSheet(f"#aboutHero {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']}; border-radius:10px; }}")
+        hero_l = QVBoxLayout(hero); hero_l.setContentsMargins(24, 20, 24, 20)
+        title = QLabel("UploadRanger"); title.setStyleSheet(f"font-size:30px;font-weight:700;color:{COLORS['accent']};")
+        subtitle = QLabel("文件上传安全测试与证据化验证工具"); subtitle.setStyleSheet(f"font-size:14px;color:{COLORS['text_secondary']};")
+        version = QLabel(f"当前版本  v{CURRENT_VERSION}"); version.setStyleSheet(f"color:{COLORS['info']};font-weight:600;")
+        hero_l.addWidget(title); hero_l.addWidget(subtitle); hero_l.addWidget(version)
+        grid.addWidget(hero)
+
+        def card(title_text, body_text, color=None):
+            frame = QFrame(); frame.setStyleSheet(f"QFrame {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']}; border-radius:8px; }}")
+            lay = QVBoxLayout(frame); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(6)
+            h = QLabel(title_text); h.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard); h.setStyleSheet(f"font-size:15px;font-weight:600;color:{color or COLORS['text_primary']};")
+            b = QLabel(body_text); b.setWordWrap(True); b.setTextFormat(Qt.TextFormat.RichText); b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard); b.setStyleSheet(f"font-size:13px;color:{COLORS['text_secondary']};")
+            lay.addWidget(h); lay.addWidget(b); return frame
+
+        grid.addWidget(card("核心能力", "异步上传扫描、原始 multipart 请求解析、文件访问验证、Repeater 重放、Intruder 字典测试、绕过技术与 Polyglot 生成，并支持 MCP stdio/SSE 接入。"))
+        grid.addWidget(card("v1.2.0 处理链路", "抓取请求 → 模板化构造 → Payload 变异 → 上传响应分析 → 同源访问验证 → 证据化结果。未完成验证的响应信号不会直接升级为高危。", COLORS['info']))
+        grid.addWidget(card("浏览器抓包提示", "抓取 localhost/127.0.0.1 时：Chrome/Edge 可使用 <code>--proxy-bypass-list='&lt;-loopback&gt;'</code>；Firefox 检查 <code>network.proxy.allow_hijacking_localhost</code>；代理工具中不要把本地地址加入 bypass 列表。", COLORS['warning']))
+
+        actions = QHBoxLayout(); actions.addStretch()
+        reset_btn = QPushButton("重置界面"); reset_btn.setToolTip("恢复 Repeater/Intruder 等标签页")
+        reset_btn.clicked.connect(self.reset_tabs); actions.addWidget(reset_btn)
+        author = QLabel("作者：bae  ·  开源项目"); author.setStyleSheet(f"color:{COLORS['text_secondary']};"); actions.addWidget(author); actions.addStretch()
+        grid.addLayout(actions)
+        warning = QLabel("仅用于获得授权的安全测试。请遵守适用法律、合同和测试范围约束。")
+        warning.setWordWrap(True); warning.setAlignment(Qt.AlignmentFlag.AlignCenter); warning.setStyleSheet(f"color:{COLORS['danger']};font-size:12px;")
+        grid.addWidget(warning)
+        grid.addStretch()
+        scroll.setWidget(content); outer.addWidget(scroll)
         self.tabs.addTab(about_tab, "关于")
     
     def _create_status_bar(self):
@@ -1999,11 +2244,21 @@ class MainWindow(QMainWindow):
         url = _field_str("targetUrl")
         param = _field_str("fileParam", "file")
         udir = _field_str("uploadDir")
+        strategy = _field_str("strategyMode", "adaptive")
+        payload_limit = wiz.field("payloadLimit")
         if url:
             self.url_input.setText(url)
         if param:
             self.param_input.setCurrentText(param)
         self.upload_dir_input.setText(udir)
+        strategy_index = self.strategy_mode_combo.findData(strategy)
+        if strategy_index >= 0:
+            self.strategy_mode_combo.setCurrentIndex(strategy_index)
+        try:
+            if payload_limit is not None:
+                self.payload_limit_spin.setValue(int(payload_limit))
+        except (TypeError, ValueError):
+            pass
         for i in range(self.tabs.count()):
             if self.tabs.tabText(i) == "扫描":
                 self.tabs.setCurrentIndex(i)
@@ -2059,6 +2314,43 @@ class MainWindow(QMainWindow):
                     self.stop_btn.setEnabled(False)
         except Exception:
             pass
+
+    def _start_scan_from_request(self, request_data):
+        """从 TrafficViewer/代理/Repeater 接收请求并启动扫描。
+
+        当前先把请求解析结果注入扫描配置，保留兼容的 URL 扫描链；
+        RequestTemplate 直传 AsyncScanner 将在 R9 完成后启用。
+        """
+        try:
+            raw = request_data.get("raw_request") if isinstance(request_data, dict) else None
+            if not raw:
+                data = request_data if isinstance(request_data, dict) else {}
+                method = data.get("method", "POST")
+                url = data.get("url") or data.get("target_url") or ""
+                headers = data.get("request_headers") or data.get("headers") or ""
+                if isinstance(headers, dict):
+                    headers = "\r\n".join(f"{k}: {v}" for k, v in headers.items())
+                body = data.get("request_body") or data.get("body") or ""
+                if isinstance(body, bytes):
+                    body = body.decode("latin-1", errors="replace")
+                raw = f"{method} {url} HTTP/1.1\r\n{headers}\r\n\r\n{body}"
+            template = parse_raw_request(raw, base_url=self.url_input.text().strip() or None)
+            if not template.file_parts:
+                raise ValueError("当前请求不是 multipart 文件上传请求；请选择上传接口的 POST 请求，而非 /uploads/ 文件访问验证请求。")
+            self._pending_request_template = template
+            self.url_input.setText(template.url)
+            if template.file_parts:
+                self.param_input.setCurrentText(template.file_parts[0].field)
+            cookie = next((v for k, v in template.headers.items() if k.lower() == "cookie"), "")
+            self.cookie_input.setText(cookie)
+            self.upload_dir_input.clear()
+            self.tabs.setCurrentWidget(self.tabs.widget(0))
+            self._log(f"已从请求导入扫描目标：{template.method} {template.url}")
+            self._log(f"识别文件字段：{', '.join(p.field for p in template.file_parts)}")
+            self._start_scan()
+        except Exception as exc:
+            self._log(f"从请求启动扫描失败：{exc}")
+            QMessageBox.warning(self, "请求导入失败", str(exc))
     
     def _open_github(self):
         """打开GitHub项目主页"""
@@ -2075,6 +2367,7 @@ class MainWindow(QMainWindow):
     
     def _start_scan(self):
         """开始扫描"""
+        self._scan_finished_handled = False
         url = self.url_input.text().strip()
         
         if not url:
@@ -2091,6 +2384,7 @@ class MainWindow(QMainWindow):
         
         # 获取扫描模式配置
         scan_mode = self._get_scan_mode()
+        strategy_mode = self._get_strategy_mode()
         webshell_config = self._get_webshell_config()
         self._log(f"测试模式: {'渗透测试' if scan_mode == 'penetration' else '安全测试'}")
         if webshell_config.get("enabled"):
@@ -2133,15 +2427,23 @@ class MainWindow(QMainWindow):
         
         headers = {}
         
-        # 清空结果
-        self.results_table.clear_results()
-        self.findings_table.clear_results()
-        self.details_text.clear()
-        self.traffic_viewer.clear_logs()
+        resuming = bool(self._resume_requested and self._scan_resume_index > 0)
+        if not resuming:
+            self.results_table.clear_results()
+            self.findings_table.clear_results()
+            self.details_text.clear()
+            self.traffic_viewer.clear_logs()
+        self._scan_stop_requested = False
+        if not resuming:
+            self._scan_progress_current = 0
+            self._scan_progress_total = 0
+            self._scan_resume_index = 0
         
         # 更新UI
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self._scan_finished_handled = False
         
         self._log("正在创建扫描工作线程...")
         
@@ -2160,7 +2462,13 @@ class MainWindow(QMainWindow):
             selected_extensions=selected_exts,
             scan_mode=scan_mode,  # 【新增】扫描模式
             webshell_config=webshell_config,  # 【新增】WebShell配置
+            request_template=getattr(self, '_pending_request_template', None),
+            custom_payloads=self._custom_payloads,
+            strategy_mode=strategy_mode,
+            resume_from=self._scan_resume_index if resuming else 0,
         )
+        self._resume_requested = False
+        self._pending_request_template = None
         
         self._log("连接工作线程信号...")
         
@@ -2209,10 +2517,7 @@ class MainWindow(QMainWindow):
                 self._log("Worker正在正常运行")
                 # 继续监控
                 QTimer.singleShot(2000, self._check_worker_status)
-        else:
-            self._log("警告: Worker线程为None")
-            # 恢复UI状态
-            self._on_finished(None)
+        # 正常 finished 信号独占收尾；遗留定时器不能用 None 覆盖真实 ScanResult。
     
     def _stop_scan(self):
         """停止扫描 - 修复版本，立即响应不等待"""
@@ -2220,6 +2525,16 @@ class MainWindow(QMainWindow):
         
         # 【修复】先禁用停止按钮，防止重复点击
         self.stop_btn.setEnabled(False)
+        self._scan_stop_requested = True
+        tested = len(self.results_table.results)
+        total = self._scan_progress_total or self.payload_limit_spin.value()
+        current = self._scan_progress_current or tested
+        message = f"正在停止扫描 — 已测试 {tested} 项（进度 {current}/{total}）"
+        self.progress_label.setText(message)
+        self.status_bar.showMessage(message)
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        return
         
         try:
             if hasattr(self, 'worker') and self.worker:
@@ -2253,10 +2568,24 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("扫描已停止")
             self.progress_bar.setValue(0)
             self.progress_label.setText("扫描已停止")
+
+    def _resume_scan(self):
+        """从停止时保存的 Payload 索引继续，保留已有结果和流量。"""
+        if self._scan_resume_index <= 0:
+            return
+        self._resume_requested = True
+        self._log(f"从第 {self._scan_resume_index + 1} 个 Payload 继续扫描")
+        self._start_scan()
     
     def _on_result(self, result: dict):
         """处理扫描结果 - 实时添加到结果表格"""
         self.results_table.add_result(result)
+        tested = len(self.results_table.results)
+        skipped = max(0, self._scan_progress_current - tested)
+        verified = sum(1 for item in self.results_table.results if item.get('is_vulnerability'))
+        self.scan_state_label.setText(
+            f"计划: {self._scan_progress_total or '?'} | 已测: {tested} | 跳过: {skipped} | 已验证: {verified}"
+        )
     
     def _on_finding(self, finding):
         """处理漏洞发现"""
@@ -2273,6 +2602,16 @@ class MainWindow(QMainWindow):
     def _on_progress(self, percent, message):
         """处理进度更新 - 增强版本"""
         try:
+            match = re.search(r'\((\d+)\s*/\s*(\d+)\)', message or '')
+            if match:
+                self._scan_progress_current = int(match.group(1))
+                self._scan_progress_total = int(match.group(2))
+            tested = len(self.results_table.results)
+            skipped = max(0, self._scan_progress_current - tested)
+            verified = sum(1 for item in self.results_table.results if item.get('is_vulnerability'))
+            self.scan_state_label.setText(
+                f"计划: {self._scan_progress_total or '?'} | 已测: {tested} | 跳过: {skipped} | 已验证: {verified}"
+            )
             self._log(f"进度更新: {percent}% - {message}")
             
             # 确保进度条有最小值显示
@@ -2301,6 +2640,9 @@ class MainWindow(QMainWindow):
     
     def _on_finished(self, result):
         """扫描完成 - 增强版本，处理各种异常情况"""
+        if getattr(self, '_scan_finished_handled', False):
+            return
+        self._scan_finished_handled = True
         self._log("=== 扫描完成处理开始 ===")
         
         # 确保UI状态正确恢复
@@ -2327,17 +2669,39 @@ class MainWindow(QMainWindow):
 
             # 【BUG-6修复】区分两种"成功"：
             #   analyzed_success: 分析器判定成功（含分支2，可能无HTTP验证）
-            #   verified_success:  HTTP验证通过的成功（等价于 is_vulnerability）
+            #   verified_success:  已完成文件访问验证的上传；漏洞表会按影响归并，二者不必相等。
             analyzed_success = sum(1 for r in self.results_table.results if r.get('is_success'))
             verified_success = sum(1 for r in self.results_table.results if r.get('is_vulnerability'))
 
-            if result_count == 0:
+            was_stopped = bool(
+                self._scan_stop_requested or
+                (result and getattr(result, 'stats', {}).get('stopped'))
+            )
+            if was_stopped:
+                tested = getattr(result, 'stats', {}).get('payloads_tested', result_count) if result else result_count
+                planned = getattr(result, 'stats', {}).get('payloads_planned', self._scan_progress_total) if result else self._scan_progress_total
+                skipped = getattr(result, 'stats', {}).get('payloads_skipped', 0) if result else 0
+                self._scan_resume_index = getattr(result, 'stats', {}).get('next_payload_index', 0) if result else 0
+                message = f"扫描已停止 — 已测试 {tested}/{planned or '?'} 项，跳过 {skipped} 项，已验证 {verified_success} 项"
+                self.status_bar.showMessage(message)
+                self.progress_label.setText(message)
+                self.stats_label.setText(
+                    f"已停止: {tested}/{planned or '?'} | 结果: {result_count} | 已验证: {verified_success} | 漏洞: {vuln_count}"
+                )
+                self._log(message)
+                self._scan_stop_requested = False
+                self.resume_btn.setEnabled(bool(self._scan_resume_index and planned and self._scan_resume_index < planned))
+                self.scan_state_label.setText(
+                    f"计划: {planned or '?'} | 已测: {tested} | 跳过: {skipped} | 已验证: {verified_success}"
+                )
+                return
+            elif result_count == 0:
                 self._log("扫描完成，但没有发现任何结果")
                 self.status_bar.showMessage("扫描完成 - 未发现上传漏洞")
             else:
                 self.status_bar.showMessage(
                     f"扫描完成 - 共测试 {result_count} 个payload，"
-                    f"响应判定成功 {analyzed_success} 个，已验证漏洞 {verified_success} 个，"
+                    f"响应判定成功 {analyzed_success} 个，已验证上传 {verified_success} 个，"
                     f"发现 {vuln_count} 个漏洞"
                 )
 
@@ -2346,7 +2710,7 @@ class MainWindow(QMainWindow):
             )
             self._log(
                 f"扫描完成！共测试 {result_count} 个payload，"
-                f"响应判定成功 {analyzed_success} 个，已验证漏洞 {verified_success} 个，"
+                f"响应判定成功 {analyzed_success} 个，已验证上传 {verified_success} 个，"
                 f"发现 {vuln_count} 个漏洞"
             )
             
@@ -2474,7 +2838,7 @@ Payload: {finding.payload}
             self._on_result_selected(item)
         
         # 2. 【修复】同步跳转到请求/响应界面的对应数据包
-        log_id = result.get('log_id')
+        log_id = result.get('verification_log_id') or result.get('log_id')
         if log_id:
             # 切换到请求/响应标签
             for i in range(self.tabs.count()):
@@ -2504,7 +2868,7 @@ Payload: {finding.payload}
                 'request_headers': "\n".join([f"{k}: {v}" for k, v in request_data.headers.items()]),
                 'request_body': request_data.body.decode('utf-8', errors='ignore') if request_data.body else ''
             }
-        elif 'request_body' in request_data:
+        elif isinstance(request_data, dict) and ('request_body' in request_data or 'raw_request' in request_data):
             # 扫描结果字典
             data = {
                 'method': request_data.get('method', 'POST'),
@@ -2521,6 +2885,24 @@ Payload: {finding.payload}
     
     def _load_to_intruder(self, request_data):
         """加载请求到Intruder"""
+        if isinstance(request_data, dict) and request_data.get('raw_request') and not request_data.get('method'):
+            # Raw-only 入口（例如 Repeater 右键）也必须转换成 Intruder 可编辑模板。
+            raw = str(request_data['raw_request']).replace('\r\n', '\n')
+            lines = raw.split('\n')
+            first = lines[0].split()
+            if len(first) >= 2:
+                body_at = next((i for i, line in enumerate(lines[1:], 1) if not line.strip()), len(lines))
+                hdrs = []
+                for line in lines[1:body_at]:
+                    if ':' in line:
+                        hdrs.append(line)
+                request_data = {
+                    'method': first[0],
+                    'url': first[1],
+                    'request_headers': '\n'.join(hdrs),
+                    'request_body': '\n'.join(lines[body_at + 1:]) if body_at < len(lines) else '',
+                    'raw_request': request_data['raw_request'],
+                }
         # 处理ProxyRequest对象或字典
         if hasattr(request_data, 'method'):
             # ProxyRequest对象
@@ -2542,7 +2924,7 @@ Payload: {finding.payload}
             data = request_data
         
         self.intruder.load_request(data)
-        self.tabs.setCurrentIndex(4)  # 切换到Intruder标签
+        self.tabs.setCurrentWidget(self.intruder)
         self._log("请求已加载到Intruder")
     
     def _update_payload_types(self):
@@ -2571,10 +2953,12 @@ Payload: {finding.payload}
         lang = self.payload_lang_combo.currentText().lower()
         shell_type = self.payload_type_combo.currentData()
         
-        shell = self.shell_generator.generate_shell(lang, shell_type)
+        shell = self.shell_generator.generate_shell(lang, shell_type, self.payload_password.text().strip() or None)
         
         if shell:
             code = f"# {shell['name']}\n"
+            if shell.get('password'):
+                code += f"# 密码: {shell['password']}\n"
             code += f"# 用法: {shell.get('usage', 'N/A')}\n\n"
             code += shell['code']
             self.payload_code.setPlainText(code)
@@ -2617,10 +3001,12 @@ Payload: {finding.payload}
         all_code += "=" * 60 + "\n\n"
         
         for key, info in shells.items():
-            shell = self.shell_generator.generate_shell(lang, key)
+            shell = self.shell_generator.generate_shell(lang, key, self.payload_password.text().strip() or None)
             if shell:
                 all_code += f"# {'=' * 50}\n"
                 all_code += f"# {shell['name']}\n"
+                if shell.get('password'):
+                    all_code += f"# 密码: {shell['password']}\n"
                 all_code += f"# 用法: {shell.get('usage', 'N/A')}\n"
                 all_code += f"# {'=' * 50}\n\n"
                 all_code += shell['code']

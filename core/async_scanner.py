@@ -6,6 +6,7 @@
 
 import asyncio
 import random
+import uuid
 from urllib.parse import quote, urljoin
 from typing import List, Optional, Callable
 from datetime import datetime
@@ -24,6 +25,12 @@ from .models import (
     RISK_CRITICAL, RISK_HIGH, RISK_MEDIUM, RISK_LOW,
     CONFIDENCE_CERTAIN, CONFIDENCE_HIGH, CONFIDENCE_MEDIUM
 )
+from .url_guard import safe_verification_url
+from .request_template import RequestTemplate
+from .request_mutator import mutate_file
+from .request_builder import build_raw_request
+from .request_mutator import mutate_file
+from .request_builder import build_raw_request
 
 
 class AsyncScanner:
@@ -33,11 +40,16 @@ class AsyncScanner:
         self.analyzer = AsyncResponseAnalyzer()
         self.results = []
         self.running = False
+        self._on_log_callback = None
         self.max_payloads = 1200  # 默认Payload数量限制（与GUI一致）
         # 【新增】扫描状态保存，支持继续扫描
         self._last_progress = 0  # 上次扫描到的位置
         self._saved_payloads = []  # 保存的payload列表
         self._scan_config = {}  # 保存的扫描配置
+        self._scan_nonce = ""
+        # 由 strategy_mode 控制：自适应模式允许在“真实验证成功”后跳过同后缀余项；
+        # 全量模式必须逐项请求，不能启用早停。
+        self.enable_extension_early_stop = False
     
     async def scan(self, 
                    target_url: str, 
@@ -57,10 +69,16 @@ class AsyncScanner:
                    use_raw_multipart: bool = True,
                    use_fingerprint: bool = True,
                    selected_extensions: Optional[List[str]] = None,
+                   extra_fields: Optional[dict] = None,
                    scan_mode: str = "security",  # 【新增】security / penetration
-                   webshell_config: Optional[dict] = None) -> ScanResult:  # 【新增】WebShell配置
+                   webshell_config: Optional[dict] = None,
+                   request_template: Optional[RequestTemplate] = None,
+                   custom_payloads: Optional[List[dict]] = None,
+                   strategy_mode: str = "adaptive",
+                   resume_from: int = 0) -> ScanResult:  # 【新增】WebShell配置
         """执行扫描"""
         self.running = True
+        self._scan_nonce = uuid.uuid4().hex[:10]
         start_time = datetime.now()
         if max_payloads is None:
             max_payloads = self.max_payloads
@@ -70,6 +88,7 @@ class AsyncScanner:
             on_log_callback(f"参数: target_url={target_url}, file_param={file_param}")
             on_log_callback(f"max_payloads={max_payloads}, use_fingerprint={use_fingerprint}")
             on_log_callback(f"running状态: {self.running}")
+            on_log_callback(f"本轮验证标识: {self._scan_nonce}")
         
         # 解析cookies
         cookie_dict = {}
@@ -88,14 +107,25 @@ class AsyncScanner:
         self._traffic_update_cb = on_traffic_update_callback
         self._on_result_callback = on_result_callback
         self._on_finding_callback = on_finding_callback
+        self._on_log_callback = on_log_callback
+        self._request_template = request_template
         self._use_raw = False
         self._raw_client: Optional[RawHTTPClient] = None
+        if on_log_callback and proxies:
+            on_log_callback(f"已启用代理: {', '.join(f'{k}={v}' for k, v in proxies.items())}")
         
         upload_url = target_url
-        extra_fields: Optional[dict] = None
+        extra_fields = dict(extra_fields or {})
+        if request_template is not None:
+            request_template.validate()
+            target_url = request_template.url
+            upload_url = request_template.url
+            if request_template.file_parts:
+                file_param = request_template.file_parts[0].field
+            extra_fields.update(request_template.form_fields)
 
         profile = EnvironmentProfile()
-        if use_fingerprint:
+        if use_fingerprint and request_template is None:
             try:
                 if on_log_callback:
                     on_log_callback("正在获取目标页面进行环境指纹检测...")
@@ -141,7 +171,20 @@ class AsyncScanner:
                         picked = forms[0]
 
                 if picked:
-                    upload_url = picked.get("action") or target_url
+                    discovered_upload_url = picked.get("action") or target_url
+                    # 页面表单属于不可信远程输入。自动发现只能跟随与初始
+                    # 目标严格同源的 action，避免恶意页面把扫描器导向内网或
+                    # 其他站点；需要跨站上传时，用户可显式填写目标或导入 Raw 请求。
+                    if safe_verification_url(discovered_upload_url, target_url):
+                        upload_url = discovered_upload_url
+                    else:
+                        if on_log_callback:
+                            on_log_callback(
+                                f"[安全] 已忽略自动发现的跨域/私网上传地址: {discovered_upload_url}"
+                            )
+                        picked = None
+
+                if picked:
                     ff_list = picked.get("file_fields") or []
                     if ff_list and not (file_param or "").strip():
                         file_param = (ff_list[0].get("name") or "file").strip() or "file"
@@ -149,7 +192,11 @@ class AsyncScanner:
                         # 若页面只有一个 file 字段，自动修正 file_param
                         if len(ff_list) == 1:
                             file_param = (ff_list[0].get("name") or "file").strip() or "file"
-                    extra_fields = dict(picked.get("other_fields") or {})
+                    # 页面自动推断字段作为默认值，调用方显式传入的字段优先，
+                    # 避免真实抓包/自定义模板中的 CSRF、action 等被覆盖。
+                    inferred_fields = dict(picked.get("other_fields") or {})
+                    inferred_fields.update(extra_fields)
+                    extra_fields = inferred_fields
                     # 自动提取并注入 CSRF token（避免对有 CSRF 保护的目标全部 403）
                     try:
                         fp_parser = FormParser(None)
@@ -168,7 +215,7 @@ class AsyncScanner:
                 if on_log_callback:
                     on_log_callback(f"环境指纹预检失败（使用默认策略）: {ex}")
         
-        if use_raw_multipart:
+        if use_raw_multipart and request_template is None:
             proxy_str = None
             if proxies:
                 proxy_str = proxies.get("http://") or proxies.get("https://")
@@ -188,22 +235,43 @@ class AsyncScanner:
         
         if on_log_callback:
             on_log_callback("正在生成payloads...")
-        raw_list = self._generate_payloads(None, selected_extensions, scan_mode, webshell_config)
+        builtin_payloads = self._generate_payloads(None, selected_extensions, scan_mode, webshell_config)
+        custom_payloads = self._normalize_custom_payloads(custom_payloads, selected_extensions)
+        if strategy_mode not in {"adaptive", "full", "manual"}:
+            strategy_mode = "adaptive"
+        self.enable_extension_early_stop = strategy_mode == "adaptive"
+
+        if strategy_mode == "manual":
+            raw_list = custom_payloads
+        else:
+            # 自定义项优先，确保 payload 上限较小时也不会被内置词库挤掉。
+            raw_list = self._merge_payloads(custom_payloads, builtin_payloads)
         if on_log_callback:
-            on_log_callback(f"生成原始payloads: {len(raw_list)} 个")
-        
-        if use_fingerprint:
-            if on_log_callback:
-                on_log_callback("正在使用指纹过滤payloads...")
-            payloads = filter_payloads_by_profile(
-                raw_list, profile, max_payloads, apply_disable=True, prioritize=True
+            on_log_callback(
+                f"Payload 编排: 模式={strategy_mode}，内置={len(builtin_payloads)}，"
+                f"自定义={len(custom_payloads)}，去重后={len(raw_list)}"
             )
+        
+        if strategy_mode == "adaptive" and use_fingerprint:
             if on_log_callback:
-                on_log_callback(f"指纹过滤后payloads: {len(payloads)} 个")
+                on_log_callback(
+                    "智能策略: 按环境指纹排序并排除不适用的内置变体；"
+                    "自定义 Payload 始终保留"
+                )
+            builtin_only = [p for p in raw_list if p.get("source") != "custom"]
+            selected_builtin = filter_payloads_by_profile(
+                builtin_only, profile, max_payloads, apply_disable=True, prioritize=True
+            )
+            payloads = self._merge_payloads(custom_payloads, selected_builtin)[:max_payloads]
+            if on_log_callback:
+                on_log_callback(
+                    f"智能策略结果: {len(payloads)} 个；环境={profile.server}/"
+                    f"{profile.os}/{profile.language}，置信度={profile.fingerprint_confidence:.2f}"
+                )
         else:
             payloads = raw_list[:max_payloads]
             if on_log_callback:
-                on_log_callback(f"直接截断payloads: {len(payloads)} 个")
+                on_log_callback(f"{strategy_mode} 模式不裁剪策略，实际请求: {len(payloads)} 个")
         
         if on_log_callback:
             on_log_callback(
@@ -212,6 +280,14 @@ class AsyncScanner:
             )
         
         total = len(payloads)
+        resume_from = max(0, min(int(resume_from or 0), total))
+        scan_result.stats.update({
+            "payloads_planned": total,
+            "payloads_tested": 0,
+            "payloads_skipped": 0,
+            "stopped": False,
+            "resume_from": resume_from,
+        })
         if total == 0:
             if on_log_callback:
                 on_log_callback("警告: 没有可用的payloads，扫描将立即结束")
@@ -228,9 +304,9 @@ class AsyncScanner:
             progress_callback("正在初始化扫描...", 0)
         
         # 【智能后缀判定】初始化后缀统计
-        ext_stats = {}  # {ext: {"success": 0, "total": 0, "max_confidence": 0.0}}
+        ext_stats = {}  # {ext: {"success": 0, "tested": 0, "available": 0, "max_confidence": 0.0}}
         SKIP_CONFIDENCE_THRESHOLD = 0.85  # 置信度超过此值跳过后缀其他payload
-        MIN_PAYLOADS_BEFORE_SKIP = 3  # 每个后缀至少测试3个payload后再评估
+        MIN_PAYLOADS_BEFORE_SKIP = 1  # 一个变体已完成真实访问验证即可切换到下一后缀
         
         # 【新增】保存扫描模式配置
         self._scan_mode = scan_mode
@@ -246,16 +322,30 @@ class AsyncScanner:
         for p in payloads:
             ext = p.get('ext', 'unknown')
             if ext not in ext_stats:
-                ext_stats[ext] = {"success": 0, "total": 0, "max_confidence": 0.0}
-            ext_stats[ext]["total"] += 1
+                ext_stats[ext] = {"success": 0, "tested": 0, "available": 0, "max_confidence": 0.0}
+            ext_stats[ext]["available"] += 1
 
         # 【修复】定义进度更新间隔
         update_interval = max(1, min(5, total // 100))  # 至少每5个或每1%更新一次
 
         # 收集需要跳过的后缀
         skipped_exts = set()
+        # 结果表保留每个 Payload 的完整证据；漏洞表按最终危险扩展名聚合，
+        # 避免双扩展名矩阵把同一影响重复展示数十次。
+        reported_finding_keys = set()
 
         for i, payload in enumerate(payloads):
+            if i < resume_from:
+                continue
+            ext = payload.get('ext', 'unknown')
+            if self.enable_extension_early_stop and ext in skipped_exts:
+                scan_result.stats["payloads_skipped"] += 1
+                remaining = sum(1 for p in payloads[i + 1:] if p.get('ext') == ext)
+                if on_log_callback and remaining > 0:
+                    on_log_callback(f"[跳过] .{ext.lstrip('.')} 后缀已确认，跳过剩余 {remaining} 个 Payload")
+                if progress_callback and (i == 0 or i == total - 1 or (i + 1) % update_interval == 0):
+                    progress_callback(f"跳过 .{ext.lstrip('.')} 后缀 ({i + 1}/{total})", int((i + 1) / total * 100))
+                continue
             if on_log_callback and i % 50 == 0:  # 每50个打印一次进度
                 on_log_callback(f"测试进度: {i+1}/{total}")
             
@@ -264,6 +354,8 @@ class AsyncScanner:
                     on_log_callback(f"扫描被停止，当前进度: {i}/{total}")
                 # 【修复】保存当前进度以便后续恢复
                 self._last_progress = i
+                scan_result.stats["stopped"] = True
+                scan_result.stats["next_payload_index"] = i
                 break
 
             # 【修复】更频繁的进度更新
@@ -280,6 +372,7 @@ class AsyncScanner:
                     self._test_payload(engine, upload_url, file_param, payload, inferred_upload_dir, extra_fields),
                     timeout=60  # 单个请求最多60秒
                 )
+                scan_result.stats["payloads_tested"] += 1
                 
                 # 自动推断上传目录：从第一个有路径泄露的响应中提取父目录
                 if result and not inferred_upload_dir:
@@ -297,8 +390,15 @@ class AsyncScanner:
                 # 【智能后缀判定】更新后缀统计并检查是否需要跳过后缀
                 ext = payload.get('ext', 'unknown')
                 if result:
-                    confidence = result.get('confidence', 0)
-                    is_success = result.get('is_success', False) or result.get('is_vulnerability', False)
+                    if ext in ext_stats:
+                        ext_stats[ext]["tested"] += 1
+                    confidence = result.get('success_probability', 0) / 100.0
+                    # 仅真实验证成功才允许智能后缀跳过；PENDING/响应推断不能触发。
+                    is_success = bool(
+                        result.get('verified_upload') or
+                        result.get('verified_execution') or
+                        result.get('verification', {}).get('verified')
+                    )
                     
                     if ext in ext_stats:
                         if confidence > ext_stats[ext]["max_confidence"]:
@@ -307,50 +407,55 @@ class AsyncScanner:
                             ext_stats[ext]["success"] += 1
                     
                     # 检查是否需要跳过后缀的其他payload
-                    if ext not in skipped_exts and ext in ext_stats:
+                    if self.enable_extension_early_stop and ext not in skipped_exts and ext in ext_stats:
                         stats = ext_stats[ext]
                         # 只有在测试了足够多的payload后才评估
-                        if stats["total"] >= MIN_PAYLOADS_BEFORE_SKIP:
+                        if stats["tested"] >= MIN_PAYLOADS_BEFORE_SKIP:
                             # 计算当前后缀的成功率
                             success_count = stats["success"]
-                            tested = stats["total"]
+                            tested = stats["tested"]
                             current_conf = stats["max_confidence"]
                             
-                            # 条件：置信度超过阈值 或 有明显的成功结果
-                            if current_conf >= SKIP_CONFIDENCE_THRESHOLD:
+                            # 自适应模式：一旦同后缀已被“实际访问验证”，就不再浪费
+                            # 同后缀变体请求；全量模式完全不会走到这里。
+                            if success_count >= 1:
                                 skipped_exts.add(ext)
                                 if on_log_callback:
-                                    on_log_callback(f"[智能判定] .ext 置信度已达 {current_conf:.0%}，跳过后缀其他payload")
+                                    on_log_callback(f"[智能后缀] .{ext.lstrip('.')} 已真实验证，跳过同后缀后续 Payload")
                                 if progress_callback:
-                                    progress_callback(f"[智能] .ext 后缀已确认，跳过剩余测试", current_progress)
-                            elif success_count >= 2:  # 有2个以上成功结果
-                                skipped_exts.add(ext)
-                                if on_log_callback:
-                                    on_log_callback(f"[智能判定] .ext 已获 {success_count} 个成功结果，跳过后缀其他payload")
+                                    progress_callback(f"[智能] .{ext.lstrip('.')} 已确认，扫描下一种后缀", current_progress)
                 
                         # 【修复】漏洞检查必须在这里执行，不能在 continue 之后！
                 # 如果是漏洞发现
                 if result and result.get('is_vulnerability'):
                     finding = result.get('finding')
                     if finding:
-                        scan_result.findings.append(finding)
-                        scan_result.stats["vulns_found"] += 1
-                        print(f"[AsyncScanner] 发现漏洞: {finding.name}", flush=True)
-                        if self._on_finding_callback:
-                            self._on_finding_callback(finding)
-                        if on_log_callback:
-                            on_log_callback(f"[+] 发现漏洞: {finding.name}")
+                        filename = (result.get('filename') or '').lower()
+                        final_ext = filename.rsplit('.', 1)[-1] if '.' in filename else 'unknown'
+                        finding_key = (target_url.rstrip('/').lower(), final_ext)
+                        if finding_key not in reported_finding_keys:
+                            reported_finding_keys.add(finding_key)
+                            scan_result.findings.append(finding)
+                            scan_result.stats["vulns_found"] += 1
+                            print(f"[AsyncScanner] 发现漏洞: {finding.name}", flush=True)
+                            if self._on_finding_callback:
+                                self._on_finding_callback(finding)
+                            if on_log_callback:
+                                on_log_callback(f"[+] 发现漏洞: {finding.name}")
+                        else:
+                            result['duplicate_finding'] = True
                 
                 scan_result.stats["total_requests"] += 1
                 
                 # 如果当前后缀已被标记为跳过，直接跳到下一个payload（漏洞检查已完成）
-                if ext in skipped_exts:
+                if self.enable_extension_early_stop and ext in skipped_exts:
                     remaining = sum(1 for p in payloads[i+1:] if p.get('ext') == ext)
                     if remaining > 0 and on_log_callback:
-                        on_log_callback(f"[跳过] .ext 后缀已确认，跳过剩余 {remaining} 个payload")
+                        on_log_callback(f"[跳过] .{ext.lstrip('.')} 后缀已确认，跳过剩余 {remaining} 个 Payload")
                     continue
                 
             except Exception as e:
+                scan_result.stats["payloads_tested"] += 1
                 if on_log_callback:
                     on_log_callback(f"[-] 测试失败: {str(e)}")
         
@@ -360,7 +465,9 @@ class AsyncScanner:
             self._raw_client = None
         self._use_raw = False
         self._traffic_cb = None
+        self._on_log_callback = None
         scan_result.end_time = datetime.now()
+        scan_result.stats.setdefault("next_payload_index", total)
         self.running = False
         
         if on_log_callback:
@@ -391,6 +498,7 @@ class AsyncScanner:
                            upload_dir: Optional[str] = None,
                            extra_fields: Optional[dict] = None) -> Optional[dict]:
         """测试单个payload"""
+        on_log_callback = self._on_log_callback
         content = payload['content']
         # 【修复】支持MIME类型伪造：优先使用payload指定的伪造Content-Type
         content_type = payload.get('fake_content_type', 'application/octet-stream')
@@ -401,13 +509,17 @@ class AsyncScanner:
         else:
             rand_suffix = str(random.randint(1000, 9999))
             actual_filename = f"test_{rand_suffix}.{payload['ext']}"
+        # 共享上传目录中可能存在其他扫描的同名文件；每轮使用唯一前缀，防止 stale 文件污染验证。
+        actual_filename = self._unique_scan_filename(actual_filename)
         
         # 【新增】用于保存流量日志对象，以便后续更新 is_success
         _current_log = None
         
         # 上传文件（Raw 字节级 multipart 或 httpx）
         try:
-            if self._use_raw and self._raw_client:
+            if self._request_template is not None:
+                response = await self._send_template_payload(engine, actual_filename, content, content_type)
+            elif self._use_raw and self._raw_client:
                 raw_resp = await self._run_blocking(
                     self._raw_client.upload_file,
                     target_url,
@@ -425,6 +537,8 @@ class AsyncScanner:
                     raw_resp,
                 )
                 response = wrap_raw_response(raw_resp, target_url)
+                # 防止不同 RawHTTPResponse 包装路径丢失原始请求，显式再次透传。
+                response.raw_request = getattr(raw_resp, "raw_request", b"") or b""
             else:
                 response = await engine.upload_file(
                     url=target_url,
@@ -434,11 +548,12 @@ class AsyncScanner:
                     content_type=content_type,
                     extra_data=extra_fields,
                 )
+                _current_log = engine.last_traffic_log
         except Exception as e:
             import traceback
             traceback.print_exc()
             return None
-        
+
         # 分析上传响应
         analysis = self.analyzer.analyze_upload_response(response, actual_filename)
         
@@ -455,12 +570,31 @@ class AsyncScanner:
             try:
                 # 只跟进一次，设置2秒超时避免卡住
                 redirect_url = urljoin(target_url, redirect_location)
+                if not safe_verification_url(redirect_url, target_url):
+                    if self._on_log_callback:
+                        self._on_log_callback(f"[安全] 拒绝跨域或私网重定向验证: {redirect_url}")
+                    raise ValueError("redirect URL blocked")
                 redirect_response = await asyncio.wait_for(
                     engine.check_file_existence(redirect_url),
                     timeout=2.0
                 )
+                redirect_log = getattr(engine, "last_traffic_log", None)
+                if redirect_log is not None and _current_log is not None:
+                    redirect_log.parent_log_id = _current_log.id
+                    redirect_log.is_verification = True
                 if redirect_response and redirect_response.status_code == 200:
                     followed_redirect = True
+                    redirect_analysis = self.analyzer.analyze_upload_response(
+                        redirect_response, actual_filename
+                    )
+                    if redirect_analysis.get('path_leaked') and not analysis.get('path_leaked'):
+                        analysis['path_leaked'] = redirect_analysis['path_leaked']
+                    if redirect_analysis.get('server_filename'):
+                        analysis['server_filename'] = redirect_analysis['server_filename']
+                    for name in redirect_analysis.get('verify_filenames', []):
+                        if name not in analysis['verify_filenames']:
+                            analysis['verify_filenames'].append(name)
+                    analysis['decision_reasons'].append('已分析重定向后的响应内容')
                     # 从跳转后的响应中提取服务端文件名
                     redirect_server_filename = self.analyzer._extract_server_filename_from_html(redirect_response.text)
                     if redirect_server_filename and redirect_server_filename != actual_filename:
@@ -468,6 +602,7 @@ class AsyncScanner:
             except:
                 pass
         # 格式化请求头和响应头
+        request_evidence = ""
         if isinstance(response, ScanHttpResponse):
             # 【修复】从 raw_request 中提取真正的 HTTP 请求头和请求体
             req_headers = ""
@@ -475,6 +610,8 @@ class AsyncScanner:
             if hasattr(response, 'raw_request') and response.raw_request:
                 raw_req = response.raw_request
                 try:
+                    # Raw 请求按 latin-1 保留每个字节，保证 multipart body、boundary、Cookie 不丢失。
+                    request_evidence = raw_req.decode('latin-1', errors='replace')
                     hdr_end = raw_req.find(b"\r\n\r\n")
                     if hdr_end != -1:
                         # 提取请求头（包括第一行请求行）
@@ -489,8 +626,38 @@ class AsyncScanner:
                     req_body = ""
             else:
                 # 没有 raw_request 时的回退
-                req_headers = f"POST {target_url} HTTP/1.1\nContent-Type: multipart/form-data"
-                req_body = ""
+                # Raw 上传路径理论上应携带 raw_request；若第三方响应包装丢失，
+                # 仍现场重建一个可复制的完整 multipart 请求。
+                try:
+                    fallback_template = getattr(self, "_request_template", None)
+                    if fallback_template is not None:
+                        fallback_template = mutate_file(fallback_template, file_param, actual_filename, content, content_type)
+                        raw_fallback = build_raw_request(fallback_template)
+                    else:
+                        from .request_template import RequestTemplate, FilePart
+                        from urllib.parse import urlparse
+                        parsed_target = urlparse(target_url)
+                        host = parsed_target.netloc
+                        boundary = f"----UploadRanger{self._scan_nonce}"
+                        body = (
+                            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_param}\"; filename=\"{actual_filename}\"\r\n"
+                            f"Content-Type: {content_type}\r\n\r\n"
+                        ).encode("latin-1", errors="replace") + content + f"\r\n--{boundary}--\r\n".encode()
+                        cookie_header = "; ".join(f"{k}={v}" for k, v in getattr(engine, "cookies", {}).items())
+                        cookie_line = f"Cookie: {cookie_header}\r\n" if cookie_header else ""
+                        raw_fallback = (
+                            f"POST {parsed_target.path or '/'}{('?' + parsed_target.query) if parsed_target.query else ''} HTTP/1.1\r\n"
+                            f"Host: {host}\r\nUser-Agent: {engine.headers.get('User-Agent', '')}\r\n{cookie_line}"
+                            f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+                            f"Content-Length: {len(body)}\r\n"
+                        ).encode("latin-1", errors="replace") + b"\r\n" + body
+                    request_evidence = raw_fallback.decode("latin-1", errors="replace")
+                    hdr_end = raw_fallback.find(b"\r\n\r\n")
+                    req_headers = raw_fallback[:hdr_end].decode("latin-1", errors="replace") if hdr_end >= 0 else request_evidence
+                    req_body = engine._format_request_body(raw_fallback[hdr_end + 4:]) if hdr_end >= 0 else ""
+                except Exception:
+                    req_headers = f"POST {target_url} HTTP/1.1\r\nHost: {target_url.split('://', 1)[-1].split('/', 1)[0]}\r\nContent-Type: multipart/form-data"
+                    req_body = ""
         else:
             # 【修复】httpx.Response 类型：构建完整的 HTTP 请求（包括请求行）
             req_method = getattr(response.request, 'method', 'POST')
@@ -510,6 +677,12 @@ class AsyncScanner:
                     req_body = engine._format_request_body(response.request.content)
             except:
                 pass
+            try:
+                raw_headers = req_headers.replace("\n", "\r\n").encode("latin-1", errors="replace")
+                raw_content = bytes(getattr(response.request, 'content', b"") or b"")
+                request_evidence = (raw_headers + b"\r\n\r\n" + raw_content).decode("latin-1", errors="replace")
+            except Exception:
+                request_evidence = f"{req_headers}\r\n\r\n{req_body}"
         res_headers = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
         
         # 【修复】将相对路径转换为完整URL
@@ -523,6 +696,8 @@ class AsyncScanner:
         result = {
             'filename': actual_filename,
             'payload_type': payload.get('type', 'unknown'),
+            'payload_source': payload.get('source', 'builtin'),
+            'strategy': payload.get('strategy', ''),
             'description': payload.get('desc', ''),
             'status_code': response.status_code,
             'is_success': analysis['is_success'],
@@ -534,12 +709,16 @@ class AsyncScanner:
             'decision_reasons': analysis.get('decision_reasons', []),
             'server_filename': analysis.get('server_filename'),
             'followed_redirect': followed_redirect,
+            'log_id': _current_log.id if _current_log is not None else None,
+            'verification_log_id': None,
+            'verification_attempts': [],
             'is_vulnerability': False,
             'finding': None,
             'request_headers': req_headers,
             'request_body': req_body,  # 添加请求体
             'response_headers': res_headers,
-            'response_body': response.text  # 完整响应内容
+            'response_body': response.text,
+            'response_body_bytes': getattr(response, 'content', b'') or b''
         }
         if followed_redirect:
             extra = f"重定向跟进: {redirect_location}"
@@ -552,6 +731,9 @@ class AsyncScanner:
         
         # 提取验证候选文件名
         candidates = analysis.get('verify_filenames') or [actual_filename]
+        # Flask/Werkzeug secure_filename 将隐藏文件 .htaccess 规范化为 _htaccess。
+        if actual_filename.lower() == ".htaccess" and "_htaccess" not in candidates:
+            candidates.append("_htaccess")
         
         def _looks_like_filesystem_path(p: str) -> bool:
             low = (p or "").strip()
@@ -614,8 +796,9 @@ class AsyncScanner:
 
         seen_vu = set()
         
-        # 限制验证URL数量，避免过多验证请求
-        max_verify_urls = min(len(verification_urls), 3)
+        # 显式响应路径、用户提供目录和通用目录依次加入候选。保留上限，
+        # 防止未知目标因重命名候选过多而产生无意义请求。
+        max_verify_urls = min(len(verification_urls), 12)
         for idx, u in enumerate(verification_urls):
             if idx >= max_verify_urls:
                 break
@@ -625,35 +808,69 @@ class AsyncScanner:
                 continue
             if u in seen_vu:
                 continue
+            if not safe_verification_url(u, target_url):
+                if self._on_log_callback:
+                    self._on_log_callback(f"[安全] 拒绝跨域或私网验证 URL: {u}")
+                continue
             seen_vu.add(u)
             verification_url = u
+            attempt = {
+                'url': verification_url,
+                'status_code': None,
+                'content_match': False,
+                'marker_match': False,
+            }
             try:
                 # 添加超时保护，避免验证请求卡住
                 check_resp = await asyncio.wait_for(
                     engine.check_file_existence(verification_url),
                     timeout=3.0  # 最多等待3秒
                 )
+                verification_log = engine.last_traffic_log
+                attempt['status_code'] = check_resp.status_code
                 if check_resp.status_code != 200:
+                    result['verification_attempts'].append(attempt)
                     continue
 
-                verified_upload = True
-                result['verified_upload'] = True
-                result['path_leaked'] = result.get('path_leaked') or verification_url
-                result['verification_url'] = verification_url
-                # 【修复】设置 verification 字典供前端显示
-                result['verification'] = {'verified': True, 'status': 'success'}
-
+                content_matches = check_resp.content == content
+                marker = b'UploadRanger Security Test File'
+                marker_matches = marker in content and marker in check_resp.content
+                attempt['content_match'] = bool(content_matches)
+                attempt['marker_match'] = bool(marker_matches)
                 if b"UploadForge_Test_Success_" in content:
                     if self.analyzer.analyze_execution_response(check_resp, "46"):
                         verified_execution = True
                         result['verified_execution'] = True
-                        result['verification']['execution_confirmed'] = True
+                # 仅 HTTP 200 不足以证明是本轮上传：共享目录中的 stale 文件也可能返回 200。
+                # 安全模式要求内容指纹一致；执行模式可由实际执行证据建立关联。
+                # 文本型安全测试文件可能被服务端包装；稳定标记可补充字节级
+                # 比对。图片转码等不可逆处理仍维持待验证，避免 200 误报。
+                verified_upload = bool(content_matches or marker_matches or verified_execution)
+                if verified_upload:
+                    result['verified_upload'] = True
+                    result['path_leaked'] = result.get('path_leaked') or verification_url
+                    result['verification_url'] = verification_url
+                    if verification_log is not None:
+                        verification_log.parent_log_id = result['log_id']
+                        verification_log.is_verification = True
+                        verification_log.is_success = True
+                        result['verification_log_id'] = verification_log.id
+                        if self._traffic_update_cb:
+                            self._traffic_update_cb(verification_log.id, True)
+                    result['verification'] = {
+                        'verified': True,
+                        'status': 'success',
+                        'content_match': bool(content_matches),
+                        'marker_match': bool(marker_matches),
+                        'execution_confirmed': bool(verified_execution),
+                    }
 
-                if check_resp.content == content:
-                    verified_upload = True
-
-                break
-            except:
+                    result['verification_attempts'].append(attempt)
+                    break
+                result['verification_attempts'].append(attempt)
+            except Exception as exc:
+                attempt['error'] = str(exc)
+                result['verification_attempts'].append(attempt)
                 continue
         
         # 【修复】验证优先，但无法验证时保留高置信度分析结果
@@ -662,51 +879,11 @@ class AsyncScanner:
             result['success_probability'] = 100
             result['confidence_level'] = 'high'
         else:
-            # 【修复】当无法验证但分析器已判定成功时，保留分析结果
-            # 【修复】降低置信度阈值：从'high'改为'medium'，适应upload-labs场景
-            confidence = analysis.get('confidence_level', 'low')
-            is_confident = confidence in ['high', 'medium']
-            
-            # 【新增】upload-labs特化：只要有上传目录路径证据，即使验证失败也保留成功
-            has_upload_path = (
-                result.get('path_leaked') and 
-                '/upload' in result.get('path_leaked', '').lower()
-            )
-            
-            if analysis.get('is_success') and (is_confident or has_upload_path):
-                # 分析器已判定成功，保留该结果
-                result['is_success'] = True
-                result['success_probability'] = 100
-                result['confidence_level'] = 'high'
-                
-                if has_upload_path:
-                    result['decision_reasons'].append("上传目录路径证据(验证未通过但响应确认)")
-                else:
-                    result['decision_reasons'].append("分析器高置信度成功(响应证据充分)")
-                
-                # 【BUG-1修复】分析器判定成功时，同样记录为漏洞发现
-                if not result.get('is_vulnerability'):
-                    leaked_path = result.get('path_leaked') or analysis.get('path_leaked') or ''
-                    proof_url = leaked_path
-                    if leaked_path and not leaked_path.startswith('http'):
-                        from urllib.parse import urljoin
-                        proof_url = urljoin(target_url, leaked_path)
-                    result['is_vulnerability'] = True
-                    result['finding'] = self.analyzer.create_finding(
-                        name=f"任意文件上传(响应确认) ({payload.get('type', 'unknown')})",
-                        description=f"上传 {payload.get('type', 'unknown')} 文件成功，响应中含文件路径证据（未HTTP访问验证）",
-                        risk_level=RISK_HIGH,
-                        confidence=CONFIDENCE_HIGH,
-                        url=target_url,
-                        payload=actual_filename,
-                        proof=f"响应证据: {proof_url or leaked_path or '见响应内容'}",
-                        remediation="验证文件扩展名白名单，禁止上传可执行扩展名",
-                        request_data=req_headers,
-                        response_data=response.text
-                    )
-            else:
-                result['is_success'] = False
-                result['success_probability'] = analysis['success_probability']
+            # 未通过实际访问验证时只能保留 PENDING，不创建高危漏洞。
+            result['is_success'] = False
+            result['verification_tier'] = 'PENDING'
+            result['success_probability'] = analysis['success_probability']
+            result.setdefault('decision_reasons', []).append('响应疑似成功，但文件访问验证未通过')
         
         # 构造发现结果
         if verified_execution:
@@ -720,23 +897,36 @@ class AsyncScanner:
                 payload=actual_filename,
                 proof=f"文件可在 {verification_url} 访问并执行代码",
                 remediation="验证文件扩展名白名单，禁用上传目录的执行权限",
-                request_data=req_headers,
-                response_data=response.text
+                request_data=request_evidence or f"{req_headers}\r\n\r\n{req_body}",
+                response_data=f"HTTP/1.1 {response.status_code}\r\n{res_headers}\r\n\r\n{response.text}"
             )
         elif verified_upload:
-            result['is_vulnerability'] = True
-            result['finding'] = self.analyzer.create_finding(
-                name=f"任意文件上传 ({payload.get('type', 'unknown')})",
-                description=f"成功上传 {payload.get('type', 'unknown')} 文件，服务器未阻止此扩展名",
-                risk_level=RISK_HIGH,
-                confidence=CONFIDENCE_CERTAIN,
-                url=target_url,
-                payload=actual_filename,
-                proof=f"文件可在 {verification_url} 访问",
-                remediation="验证文件扩展名白名单",
-                request_data=req_headers,
-                response_data=response.text
-            )
+            # 文件能被访问并不等于任意文件上传漏洞：正常图片、文档或
+            # 以安全扩展名结尾的双扩展名都可能是预期业务。只有服务端
+            # 实际保留危险最终扩展名时才可确认高危；其他情况保留上传
+            # 证据供人工结合执行链、SVG 渲染或服务器解析规则继续验证。
+            from config import SCAN_CONFIG
+            final_ext = actual_filename.rsplit('.', 1)[-1].lower() if '.' in actual_filename else ''
+            dangerous_exts = {str(ext).lower().lstrip('.') for ext in SCAN_CONFIG['dangerous_extensions']}
+            if final_ext in dangerous_exts:
+                result['is_vulnerability'] = True
+                result['finding'] = self.analyzer.create_finding(
+                    name=f"任意文件上传 ({payload.get('type', 'unknown')})",
+                    description=f"成功上传并可访问危险扩展名 .{final_ext} 文件",
+                    risk_level=RISK_HIGH,
+                    confidence=CONFIDENCE_CERTAIN,
+                    url=target_url,
+                    payload=actual_filename,
+                    proof=f"危险扩展名文件可在 {verification_url} 访问",
+                    remediation="使用服务端白名单校验文件类型，并禁止上传目录执行脚本",
+                    request_data=request_evidence or f"{req_headers}\r\n\r\n{req_body}",
+                    response_data=f"HTTP/1.1 {response.status_code}\r\n{res_headers}\r\n\r\n{response.text}"
+                )
+            else:
+                result['verification_tier'] = 'PENDING'
+                result.setdefault('decision_reasons', []).append(
+                    f"已验证上传 .{final_ext or '无扩展名'} 文件，但缺少可执行最终扩展名或执行证据"
+                )
         
         # 【新增】更新 TrafficLog 的 is_success 状态（用于 TrafficViewer 颜色渲染）
         if _current_log is not None:
@@ -755,7 +945,92 @@ class AsyncScanner:
                 pass
         
         return result
+
+    @staticmethod
+    def _payload_key(payload: dict) -> tuple:
+        """Use upload-relevant fields for deterministic de-duplication."""
+        content = payload.get("content", b"")
+        if isinstance(content, str):
+            content = content.encode("utf-8")
+        return (
+            str(payload.get("filename") or ""),
+            str(payload.get("ext") or "").lower().lstrip("."),
+            str(payload.get("fake_content_type") or "application/octet-stream").lower(),
+            bytes(content),
+        )
+
+    def _normalize_custom_payloads(
+        self, custom_payloads: Optional[List[dict]], selected_extensions: Optional[List[str]]
+    ) -> List[dict]:
+        """Validate GUI/API custom payloads before they enter multipart construction."""
+        allowed = None
+        if selected_extensions:
+            allowed = {str(ext).lower().lstrip(".") for ext in selected_extensions}
+        normalized: List[dict] = []
+        for index, item in enumerate(custom_payloads or []):
+            if not isinstance(item, dict) or item.get("enabled", True) is False:
+                continue
+            filename = str(item.get("filename") or "custom.bin").replace("/", "_").replace("\\", "_").strip()
+            filename = filename.lstrip(".") or "custom.bin"
+            ext = str(item.get("ext") or filename.rsplit(".", 1)[-1] if "." in filename else "bin").lower().lstrip(".")
+            if allowed is not None and ext not in allowed:
+                continue
+            content = item.get("content", b"")
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            elif not isinstance(content, bytes):
+                content = bytes(content)
+            normalized.append({
+                "type": str(item.get("type") or "custom_payload"),
+                "ext": ext,
+                "filename": filename,
+                "content": content,
+                "fake_content_type": str(item.get("content_type") or item.get("fake_content_type") or "application/octet-stream"),
+                "desc": str(item.get("description") or item.get("name") or f"Custom payload {index + 1}"),
+                "source": "custom",
+                "strategy": "custom",
+                "priority": int(item.get("priority", 100)),
+            })
+        normalized.sort(key=lambda payload: payload.get("priority", 100), reverse=True)
+        return self._merge_payloads(normalized)
+
+    def _merge_payloads(self, *groups: List[dict]) -> List[dict]:
+        """Keep custom entries first and preserve every distinct upload request."""
+        merged: List[dict] = []
+        seen = set()
+        for group in groups:
+            for raw in group or []:
+                payload = dict(raw)
+                payload.setdefault("source", "builtin")
+                key = self._payload_key(payload)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(payload)
+        return merged
+
+    def _unique_scan_filename(self, filename: str) -> str:
+        name = str(filename or "upload.bin").replace("\\", "_").replace("/", "_")
+        # 隐藏配置文件通常要求精确文件名（例如 .htaccess），不能加前缀。
+        # 其验证仍依赖响应/内容证据，避免把普通文件的唯一命名策略带入此类规则。
+        if name.startswith("."):
+            return name
+        prefix = f"ur_{self._scan_nonce}_"
+        return name if name.startswith(prefix) else prefix + name
     
+    async def _send_template_payload(self, engine, filename: str, content: bytes, content_type: str):
+        if not self._request_template or not self._request_template.file_parts:
+            raise ValueError("RequestTemplate 未包含文件字段")
+        field = self._request_template.file_parts[0].field
+        mutated = mutate_file(self._request_template, field, filename, content, content_type)
+        raw = build_raw_request(mutated)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        headers = {}
+        for line in head.split(b"\r\n")[1:]:
+            if b":" in line:
+                key, value = line.split(b":", 1)
+                headers[key.decode("latin-1")] = value.decode("latin-1").strip()
+        return await engine.request(mutated.method, mutated.url, headers=headers, content=body)
+
     def _log_raw_traffic(
         self,
         engine: AsyncHTTPClient,
@@ -794,6 +1069,8 @@ class AsyncScanner:
             request_body=req_body_text,
             response_headers=res_headers,
             response_body=res_body,
+            response_body_bytes=getattr(raw_resp, "content", b"") or b"",
+            request_raw=raw_req,
         )
         self._traffic_cb(log)
         return log  # 【新增】返回 log 对象以便后续更新 is_success
@@ -1072,13 +1349,30 @@ class U extends ClassLoader{{U(ClassLoader c){{super(c);}}
             "content": jpg_content,
             "desc": "JPEG魔术字节 + PHP"
         })
+
+        # 最终扩展名为图片的安全样本，用于验证“仅检查文件头”的上传点。
+        # 与上面的 .php 组合体不同，它们会在用户选择 jpg/png/gif 时进入队列。
+        magic_image_payloads = [
+            ("jpg", "magic_image_jpg", jpg_magic, "JPEG 魔术字节图片名"),
+            ("png", "magic_image_png", png_magic, "PNG 魔术字节图片名"),
+            ("gif", "magic_image_gif", b"GIF89a", "GIF 魔术字节图片名"),
+        ]
+        for ext, payload_type, signature, desc in magic_image_payloads:
+            payloads.append({
+                "type": payload_type,
+                "ext": ext,
+                "filename": f"uploadranger_magic.{ext}",
+                "content": signature + php_content,
+                "fake_content_type": f"image/{'jpeg' if ext == 'jpg' else ext}",
+                "desc": desc,
+            })
         
         # 6. XSS SVG - 【新增】更多XSS payload
         svg_payloads = [
-            b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(\'UploadForge\')"></svg>',
-            b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
-            b'<svg/onload=alert(document.domain)>',
-            b'<img src=x onerror=alert(1)>',
+            b'<svg xmlns="http://www.w3.org/2000/svg" onload="console.log(\'UploadRanger\')"></svg>',
+            b'<svg xmlns="http://www.w3.org/2000/svg" onload="console.log(1)"></svg>',
+            b'<svg/onload=console.log(document.domain)>',
+            b'<img src=x onerror=console.log(1)>',
         ]
         for i, svg in enumerate(svg_payloads):
             payloads.append({
@@ -1265,6 +1559,34 @@ class U extends ClassLoader{{U(ClassLoader c){{super(c);}}
 
         # 14. 扩展：批量绕过变体（用于把"Payload上限"真正变成"可扩展的词库"）
         # 【删除】压缩包相关已移除（zip、rar、7z、tar、gz、bz2）
+        # 用户明确选择但词库没有专用变体的格式，至少发送一次安全探测，
+        # 避免 GUI 显示已选择却实际请求数为 0。
+        generic_content = f"UploadRanger format probe v{VERSION}\n".encode()
+        specialized_exts = {str(p.get("ext", "")).lower().lstrip(".") for p in payloads}
+        if selected_exts_clean is not None:
+            for selected_ext in selected_exts_clean:
+                selected_ext = selected_ext.lower().lstrip(".")
+                if selected_ext in specialized_exts:
+                    continue
+                if selected_ext == "htaccess":
+                    payloads.append({
+                        "type": "htaccess_probe",
+                        "ext": "htaccess",
+                        "filename": ".htaccess",
+                        "content": b"# UploadRanger harmless configuration probe\n",
+                        "fake_content_type": "text/plain",
+                        "desc": ".htaccess 安全上传探测",
+                    })
+                else:
+                    payloads.append({
+                        "type": f"generic_format_{selected_ext or 'bin'}",
+                        "ext": selected_ext or "bin",
+                        "filename": f"uploadranger_probe.{selected_ext or 'bin'}",
+                        "content": generic_content,
+                        "fake_content_type": "application/octet-stream",
+                        "desc": f"通用格式上传探测 .{selected_ext or 'bin'}",
+                    })
+
         safe_exts = [
             "jpg", "jpeg", "png", "gif", "bmp", "webp", "ico", "svg",
             "txt", "log", "csv", "json", "xml", "yml", "yaml", "ini",
@@ -1397,12 +1719,9 @@ class U extends ClassLoader{{U(ClassLoader c){{super(c);}}
             filtered: List[dict] = []
             for p in deduped:
                 payload_ext = p.get("ext", "")
-                # 检查payload的扩展名是否在用户选择的后缀中
-                # 或者扩展名在恶意变体列表中（会被二次扩展名绕过使用）
-                malicious_variants_exts = {"php", "phtml", "pht", "phar", "php3", "php4", "php5", "php7", 
-                                           "asp", "aspx", "asa", "cer", "cdx", "ashx", "asmx", "asax",
-                                           "jsp", "jspx", "jspf", "jhtml", "pl", "cgi", "py"}
-                if payload_ext in selected_exts_clean or payload_ext in malicious_variants_exts:
+                # selected_extensions 是严格的目标扩展名过滤器；不能因为 payload 属于
+                # “恶意变体”就绕过用户选择，否则选 jpg 仍会发送 PHP/ASP，造成配置失真。
+                if payload_ext in selected_exts_clean:
                     filtered.append(p)
             deduped = filtered
 
