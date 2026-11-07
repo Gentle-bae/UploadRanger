@@ -19,9 +19,13 @@ import zlib
 import time
 import random
 import hashlib
+import struct
+import ipaddress
 from urllib.parse import urlparse, urlencode
 from typing import Dict, Optional, List, Tuple, Any
 from dataclasses import dataclass, field
+
+from .proxy_config import ProxyConfig
 
 
 # =============================================================================
@@ -40,10 +44,20 @@ class RawHTTPResponse:
     raw_response: bytes = b""
     elapsed_time: float = 0.0
     error: Optional[str] = None
-    
+    # 【新增】响应体读取因超时/大小上限/连接提前关闭而不完整时置 True
+    truncated: bool = False
+    # 【新增】Content-Encoding 解压失败时置 True（content 保留原始压缩字节）
+    decompress_failed: bool = False
+
     @property
     def text(self) -> str:
         """尝试解码响应内容"""
+        if self.decompress_failed:
+            # 【修复】解压失败不再静默输出乱码：保留原字节并明确标注
+            return (
+                f"[decompress failed, {len(self.content)} bytes kept raw]\n"
+                + self.content.decode('latin-1', errors='replace')
+            )
         # 尝试多种编码
         for encoding in ['utf-8', 'gbk', 'gb2312', 'latin-1']:
             try:
@@ -324,22 +338,31 @@ class RawHTTPClient:
     DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     DEFAULT_TIMEOUT = 30
     
-    def __init__(self, 
-                 timeout: int = DEFAULT_TIMEOUT, 
+    def __init__(self,
+                 timeout: int = DEFAULT_TIMEOUT,
                  proxy: Optional[str] = None,
                  verify_ssl: bool = True,
                  delay: float = 0,
-                 user_agent: Optional[str] = None):
+                 user_agent: Optional[str] = None,
+                 body_read_timeout: float = 15.0,
+                 max_body_size: int = 4 * 1024 * 1024):
         self.timeout = timeout
         self.proxy = proxy
         self.verify_ssl = verify_ssl
         self.delay = delay
         self.user_agent = user_agent or self.DEFAULT_USER_AGENT
-        
+        # 响应体读取上限（可配置，替代原硬编码 5s/3s/1MB）
+        self.body_read_timeout = body_read_timeout
+        self.max_body_size = max_body_size
+
+        # 【修复】代理配置统一走 ProxyConfig：非法输入直接抛 ValueError 由上层
+        # 显式呈现，不再静默回退直连（用户以为在抓包/走内网代理，实际裸发）。
+        self.proxy_config = ProxyConfig.parse(proxy) if proxy else None
+
         # 会话状态
         self.cookies: Dict[str, str] = {}
         self.custom_headers: Dict[str, str] = {}
-        
+
         # 用于保持连接
         self._sock: Optional[socket.socket] = None
         self._last_host: Optional[str] = None
@@ -403,68 +426,70 @@ class RawHTTPClient:
         
         return sock
     
-    def _parse_proxy(self) -> Tuple[Optional[str], Optional[int], bool]:
-        """解析代理设置"""
-        if not self.proxy:
-            return None, None, False
-        
-        parsed = urlparse(self.proxy)
-        return parsed.hostname, parsed.port or 8080, parsed.scheme == 'https'
-    
-    def _build_proxy_request(self, builder: RawHTTPBuilder) -> bytes:
-        """构建代理请求（CONNECT或直接转发）"""
-        proxy_host, proxy_port, proxy_ssl = self._parse_proxy()
-        
-        if not proxy_host:
-            return builder.build()[0]
-        
-        # HTTP代理
-        if proxy_ssl:
-            # HTTPS代理需要CONNECT
-            connect_request = f"CONNECT {builder.host}:{builder.port} HTTP/1.1\r\n"
-            connect_request += f"Host: {builder.host}:{builder.port}\r\n"
-            connect_request += "\r\n"
-            
-            # 先发送CONNECT建立隧道
-            proxy_sock = socket.create_connection((proxy_host, proxy_port), timeout=self.timeout)
-            
-            if builder.use_ssl:
-                context = ssl.create_default_context()
-                sock = context.wrap_socket(proxy_sock, server_hostname=builder.host)
-            else:
-                sock = proxy_sock
-            
-            # 发送CONNECT
-            sock.send(connect_request.encode())
-            
-            # 读取CONNECT响应
-            response = b""
-            while b"\r\n\r\n" not in response:
-                response += sock.recv(4096)
-            
-            # 检查是否成功
-            if b"200" not in response.split(b"\r\n")[0]:
-                raise Exception(f"Proxy CONNECT failed: {response.decode()}")
-            
-            # 保存连接
-            self._sock = sock
-            self._last_host = builder.host
-            self._last_port = builder.port
-            self._last_ssl = builder.use_ssl
-            
-            # 发送实际请求
-            request, _ = builder.build()
-            sock.send(request)
-            return b""  # 请求已直接发送
-        
-        else:
-            # HTTP代理，直接转发
-            sock = socket.create_connection((proxy_host, proxy_port), timeout=self.timeout)
-            self._sock = sock
-            
-            request, _ = builder.build()
-            sock.send(request)
-            return b""
+    def _connect_via_socks5(self, dst_host: str, dst_port: int) -> socket.socket:
+        """经 SOCKS5 代理与目标建立连接（RFC1928 握手 + RFC1929 用户名密码认证）。
+
+        - 配置了凭据才携带 0x02 用户名密码方法；
+        - CONNECT 的 ATYP：IPv4/IPv6 字面量用对应 ATYP，其余按 domain 交给
+          代理端解析（等价 socks5h 语义，内网渗透场景必需）；
+        - 应答按 atyp 消费绑定地址。
+        """
+        pc = self.proxy_config
+        if pc is None:
+            raise ValueError("SOCKS5 连接需要先配置代理")
+        sock = socket.create_connection((pc.host, pc.port), timeout=self.timeout)
+        sock.settimeout(self.timeout)
+
+        def recv_exact(n: int) -> bytes:
+            buf = b""
+            while len(buf) < n:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    raise ConnectionError("SOCKS5 握手中断")
+                buf += chunk
+            return buf
+
+        try:
+            # 1) 方法协商
+            methods = b"\x00\x02" if (pc.username or pc.password) else b"\x00"
+            sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+            ver, method = recv_exact(2)
+            if ver != 0x05 or method == 0xFF:
+                raise ConnectionError("SOCKS5 代理不接受可用认证方法")
+            if method == 0x02:  # RFC1929 用户名密码子协商
+                u, p = (pc.username or "").encode("utf-8"), (pc.password or "").encode("utf-8")
+                sock.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+                if recv_exact(2)[1] != 0x00:
+                    raise ConnectionError("SOCKS5 认证失败")
+
+            # 2) CONNECT 请求
+            try:
+                ip = ipaddress.ip_address(dst_host)
+                addr, atyp = ip.packed, (0x04 if ip.version == 6 else 0x01)
+                body = bytes([atyp]) + addr
+            except ValueError:
+                addr = dst_host.encode("idna")
+                body = bytes([0x03, len(addr)]) + addr
+            sock.sendall(b"\x05\x01\x00" + body + struct.pack(">H", dst_port))
+
+            # 3) 应答：按 atyp 消费绑定地址
+            resp = recv_exact(4)
+            if resp[1] != 0x00:
+                raise ConnectionError(f"SOCKS5 CONNECT 失败: code={resp[1]}")
+            if resp[3] == 0x01:    # IPv4
+                recv_exact(4 + 2)
+            elif resp[3] == 0x04:  # IPv6
+                recv_exact(16 + 2)
+            else:                  # domain
+                recv_exact(recv_exact(1)[0] + 2)
+            return sock
+        except Exception:
+            # 握手失败时关闭半开连接，避免套接字泄漏
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
     
     def _send_request(self, builder: RawHTTPBuilder) -> RawHTTPResponse:
         """发送请求并接收响应"""
@@ -475,25 +500,48 @@ class RawHTTPClient:
             host = builder.host
             port = builder.port
             use_ssl = builder.use_ssl
-            
-            # 如果使用代理，修改目标
-            proxy_host, proxy_port, _ = self._parse_proxy()
-            
-            if proxy_host:
+
+            # 代理分派：no_proxy 命中（含 *.domain 通配）时直连，其余按协议分流
+            pc = self.proxy_config
+            if pc is not None and pc.matches_no_proxy(host):
+                pc = None
+
+            if pc is not None and pc.is_socks:
+                # socks5/socks5h → SOCKS5 握手建连，之后按 use_ssl 决定是否 wrap TLS
+                sock = self._connect_via_socks5(host, port)
+                if use_ssl:
+                    context = ssl.create_default_context()
+                    if not self.verify_ssl:
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                    sock = context.wrap_socket(sock, server_hostname=host)
+                self._sock = sock
+                self._last_host = host
+                self._last_port = port
+                self._last_ssl = use_ssl
+                request, _ = builder.build()
+                sock.sendall(request)
+            elif pc is not None:
+                # http/https 代理：CONNECT（HTTPS 目标）/ absolute-URI（HTTP 目标）
+                # 认证代理需补 Proxy-Authorization: Basic（CONNECT 与转发请求都要带）
+                proxy_auth = pc.auth_header
                 if use_ssl:
                     # HTTPS over HTTP Proxy -> CONNECT
-                    sock = self._create_socket(proxy_host, proxy_port, False)
-                    connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+                    sock = self._create_socket(pc.host, pc.port, False)
+                    connect_req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                    if proxy_auth:
+                        connect_req += f"Proxy-Authorization: {proxy_auth}\r\n"
+                    connect_req += "\r\n"
                     sock.sendall(connect_req.encode())
-                    
+
                     # wait for 200 OK
                     resp = b""
                     while b"\r\n\r\n" not in resp:
                         resp += sock.recv(4096)
-                    
+
                     if b"200" not in resp.split(b"\r\n")[0]:
                         raise Exception(f"Proxy CONNECT failed: {resp.decode('latin-1')}")
-                    
+
                     # wrap SSL
                     context = ssl.create_default_context()
                     if not self.verify_ssl:
@@ -502,15 +550,17 @@ class RawHTTPClient:
                     sock = context.wrap_socket(sock, server_hostname=host)
                     self._sock = sock
                     self._last_ssl = True
-                    
+
                     request, _ = builder.build()
                     sock.sendall(request)
                 else:
                     # HTTP over HTTP Proxy -> absolute URI
-                    sock = self._create_socket(proxy_host, proxy_port, False)
+                    sock = self._create_socket(pc.host, pc.port, False)
                     # modify builder path to absolute URI
                     original_path = builder.path
                     builder.path = f"http://{host}:{port}{original_path}"
+                    if proxy_auth:
+                        builder.headers['Proxy-Authorization'] = proxy_auth
                     request, _ = builder.build()
                     builder.path = original_path # restore
                     sock.sendall(request)
@@ -572,43 +622,56 @@ class RawHTTPClient:
                     elif line.lower().startswith(b'transfer-encoding:') and b'chunked' in line.lower():
                         is_chunked = True
                 
+                truncated = False
                 if content_length >= 0:
-                    # 【修复】限制body读取时间
+                    # 【修复】读取上限提为构造参数 body_read_timeout/max_body_size，
+                    # 提前退出（超时/超限/连接提前关闭）时置 truncated 供上层判断
                     body_start_time = time.time()
                     while len(body_part) < content_length:
-                        if time.time() - body_start_time > 5:  # 最多5秒读body
+                        if time.time() - body_start_time > self.body_read_timeout:
+                            truncated = True
+                            break
+                        if len(body_part) >= self.max_body_size:
+                            truncated = True
                             break
                         try:
                             sock.settimeout(1.0)
                             chunk = sock.recv(8192)
                             if not chunk:
+                                truncated = True  # 连接提前关闭，body 不完整
                                 break
                             body_part += chunk
                             response_data += chunk
                         except socket.timeout:
+                            truncated = True
                             break
                 elif is_chunked:
-                    # 【修复】限制chunked读取时间
+                    # 【修复】chunked 读取上限同样提为构造参数，并跟踪截断状态
                     chunked_start_time = time.time()
                     while b"0\r\n\r\n" not in body_part:
-                        if time.time() - chunked_start_time > 5:
+                        if time.time() - chunked_start_time > self.body_read_timeout:
+                            truncated = True
+                            break
+                        if len(body_part) >= self.max_body_size:
+                            truncated = True
                             break
                         try:
                             sock.settimeout(1.0)
                             chunk = sock.recv(8192)
                             if not chunk:
+                                truncated = True  # 终止块未到连接已关闭
                                 break
                             body_part += chunk
                             response_data += chunk
                         except socket.timeout:
+                            truncated = True
                             break
                 else:
                     # 没有content-length也不是chunked，读取直到超时或连接关闭
-                    # 【修复】限制读取时间和数据量
+                    # 【修复】读取时间和数据量上限提为构造参数
                     no_cl_start_time = time.time()
-                    max_no_cl_size = 1024 * 1024  # 最多1MB
-                    while len(response_data) < max_no_cl_size:
-                        if time.time() - no_cl_start_time > 3:  # 最多3秒
+                    while len(response_data) < self.max_body_size:
+                        if time.time() - no_cl_start_time > self.body_read_timeout:
                             break
                         try:
                             sock.settimeout(1.0)
@@ -618,11 +681,13 @@ class RawHTTPClient:
                             response_data += chunk
                         except socket.timeout:
                             break
-            
+                    if len(response_data) >= self.max_body_size:
+                        truncated = True
+
             elapsed = time.time() - start_time
-            
+
             # 解析响应
-            resp = self._parse_response(response_data, elapsed)
+            resp = self._parse_response(response_data, elapsed, truncated=truncated)
             resp.raw_request = request
             
             # 【修复】请求完成后关闭连接，避免复用导致的超时
@@ -639,8 +704,8 @@ class RawHTTPClient:
                 elapsed_time=elapsed
             )
     
-    def _parse_response(self, data: bytes, elapsed: float) -> RawHTTPResponse:
-        """解析HTTP响应"""
+    def _parse_response(self, data: bytes, elapsed: float, truncated: bool = False) -> RawHTTPResponse:
+        """解析HTTP响应（truncated：上层读取阶段已判定响应体不完整）"""
         if not data:
             return RawHTTPResponse(
                 status_code=0,
@@ -699,18 +764,30 @@ class RawHTTPClient:
             body = self._decode_chunked(body)
 
         encoding = headers.get('content-encoding', '').lower()
+        decompress_failed = False
         try:
             if 'gzip' in encoding:
-                body = gzip.decompress(body)
+                try:
+                    body = gzip.decompress(body)
+                except (OSError, zlib.error):
+                    # 【修复】gzip 解压失败时回退尝试 raw deflate（wbits=-15），
+                    # 部分服务器/中间件的 Content-Encoding 标注与实际流不匹配
+                    body = zlib.decompress(body, wbits=-15)
             elif 'deflate' in encoding:
-                body = zlib.decompress(body)
+                try:
+                    body = zlib.decompress(body)
+                except zlib.error:
+                    # 【修复】deflate 缺 zlib 头的 raw 变体（wbits=-15）回退
+                    body = zlib.decompress(body, wbits=-15)
         except (OSError, zlib.error):
-            pass
-        
+            # 【修复】解压失败不再静默吞掉：content 保留原始字节，
+            # text 属性会输出 [decompress failed] 标注（见 RawHTTPResponse.text）
+            decompress_failed = True
+
         # 更新cookies
         if 'set-cookie' in headers:
             self._update_cookies(headers['set-cookie'])
-        
+
         return RawHTTPResponse(
             status_code=status_code,
             status_message=status_message,
@@ -718,7 +795,9 @@ class RawHTTPClient:
             content=body,
             raw_headers=raw_headers,
             raw_response=data,
-            elapsed_time=elapsed
+            elapsed_time=elapsed,
+            truncated=truncated,
+            decompress_failed=decompress_failed,
         )
     
     def _decode_chunked(self, body: bytes) -> bytes:
@@ -746,8 +825,9 @@ class RawHTTPClient:
         """更新Cookie"""
         # Set-Cookie format: "name=value; Path=/; HttpOnly; Expires=..."
         # Only the first "name=value" pair before the first ";" is the actual cookie.
-        # Splitting on "," handles multiple Set-Cookie values joined by the header parser.
-        for part in cookie_header.split(','):
+        # 【修复】解析与上方合并统一用 '\n' 分隔——按 ',' 切分会把
+        # Expires=Wed, 21 Oct 2015 ... 的日期从逗号处切开，污染 Cookie 值。
+        for part in cookie_header.split('\n'):
             # Take only the cookie name=value (before the first ";")
             cookie_part = part.strip().split(';')[0].strip()
             if '=' in cookie_part:

@@ -7,7 +7,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLineEdit,
     QPushButton, QComboBox, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QGroupBox, QCheckBox, QPlainTextEdit,
-    QMenu, QDialog, QDialogButtonBox, QTextEdit as QDialogTextEdit
+    QMenu, QDialog, QDialogButtonBox, QTextEdit as QDialogTextEdit,
+    QApplication
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
@@ -17,6 +18,9 @@ from gui.syntax_highlighter import HTTPHighlighter
 from core.config_manager import ConfigManager
 from .models import InterceptedFlow
 from .proxy_thread import ProxyThread
+
+# 历史列表容量上限：超限淘汰最旧行，防止记录（含响应体 bytes）无限累积
+MAX_HISTORY = 5000
 
 class ProxyHistoryTab(QWidget):
     """代理历史标签页"""
@@ -266,6 +270,11 @@ class ProxyHistoryTab(QWidget):
     
     def add_request(self, intercepted: InterceptedFlow):
         """【修复】添加请求到历史 - 自动应用过滤规则"""
+        # 【修复】达到容量上限时淘汰最旧记录，保持 self.history 与表格行号对齐
+        if len(self.history) >= MAX_HISTORY:
+            self.history.pop(0)
+            self.history_table.removeRow(0)
+
         self.history.append(intercepted)
         
         row = self.history_table.rowCount()

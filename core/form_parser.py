@@ -212,6 +212,10 @@ class FormParser:
             (r"\$\.(?:post|ajax)\s*\(\s*[`\"']([^`\"']+)[`\"']", "jquery"),
             (r"\.post\s*\(\s*[`\"']([^`\"']+)[`\"']", ".post"),
             (r"\.put\s*\(\s*[`\"']([^`\"']+)[`\"']", ".put"),
+            # 【新增】layui / 前端上传组件的对象式写法：upload.render({ url: '/upload/' })
+            (r"upload\.render\s*\(\s*\{[^}]*?url\s*:\s*[`\"']([^`\"']+)[`\"']", "layui.upload"),
+            # 对象属性式 url: '...upload...'（webpack 打包后的上传配置常见）
+            (r"url\s*:\s*[`\"']([^`\"']*(?:upload|file/upload|uploadfile)[^`\"']*)[`\"']", "js-url"),
         ]
 
         keywords = (

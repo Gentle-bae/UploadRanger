@@ -15,6 +15,34 @@ from .models import TrafficLog
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 DEFAULT_TIMEOUT = 30
 
+# 流量日志体预览上限：超过 32KB 的请求/响应体不再全量解码进 TrafficLog
+MAX_LOG_BODY_BYTES = 32768
+
+
+def _truncate_bytes_preview(content: bytes) -> str:
+    """超限字节的截断预览：文本返回前 32KB，二进制返回前 16KB hex，均标注总字节数"""
+    total = len(content)
+    prefix = content[:MAX_LOG_BODY_BYTES]
+    text_preview = None
+    try:
+        text_preview = prefix.decode('utf-8')
+    except UnicodeDecodeError:
+        # 截断点可能落在多字节字符中间，逐字节回退重试
+        for trim in range(1, 4):
+            try:
+                text_preview = prefix[:-trim].decode('utf-8')
+                break
+            except UnicodeDecodeError:
+                continue
+    if text_preview is not None:
+        return text_preview + f"\n... [truncated, total {total} bytes]"
+    # 二进制内容：前 16KB hex 预览
+    return (
+        f"[Binary Content - {total} bytes, showing first 16KB]\n"
+        f"{content[:16384].hex()}\n"
+        f"... [truncated, total {total} bytes]"
+    )
+
 
 class AsyncHTTPClient:
     """异步HTTP客户端"""
@@ -48,11 +76,22 @@ class AsyncHTTPClient:
             for scheme, proxy_url in proxies.items():
                 mounts[scheme] = httpx.AsyncHTTPTransport(proxy=proxy_url)
 
+        # 【修复 P1】证书源与 RawHTTPClient 统一（系统证书库）：
+        # httpx 默认走 certifi，对"证书链不完整但系统已装中间证书"的靶场
+        # （如部分 CTF 靶机）会全部 SSL 失败，而 raw socket 用系统 store 能过，
+        # 造成"上传成功、验证 GET 全挂"的分裂行为。
+        import ssl as _ssl
+        if verify_ssl:
+            _ctx = _ssl.create_default_context()
+            verify_arg = _ctx
+        else:
+            verify_arg = False
+
         self.client = httpx.AsyncClient(
             headers=self.headers,
             cookies=self.cookies,
             timeout=timeout,
-            verify=verify_ssl,
+            verify=verify_arg,
             trust_env=False,
             mounts=mounts if mounts else None
         )
@@ -69,72 +108,92 @@ class AsyncHTTPClient:
         return response
     
     def _format_request_body(self, content: bytes) -> str:
-        """格式化请求体 - 尝试多种解码方式，显示完整内容"""
+        """格式化请求体 - 进入任何解码前先判长度，超限直接返回截断预览
+
+        【修复】原实现依赖解码失败才走 hex 截断分支，但 bytes.decode('latin-1')
+        对任意字节序列永不失败，导致截断分支不可达、任意大请求体全量进入 TrafficLog。
+        """
         if not content:
             return ""
-        
+
+        # 【修复】先判长度：超过 32KB 直接截断，让原设计的截断分支真正可达
+        if len(content) > 32768:
+            return _truncate_bytes_preview(content)
+
         # 尝试UTF-8解码
         try:
             decoded = content.decode('utf-8')
             return decoded
         except:
             pass
-        
+
         # 尝试Latin-1解码（不会失败）
         try:
             decoded = content.decode('latin-1')
             return decoded
         except:
             pass
-        
+
         # 尝试GBK解码
         try:
             decoded = content.decode('gbk')
             return decoded
         except:
             pass
-        
+
         # 作为十六进制显示（增大预览，避免 polyglot/图片响应被截得过短）
         if len(content) > 8192:
             hex_content = content[:8192].hex()
             return f"[Binary Content - {len(content)} bytes, showing first 8KB]\n{hex_content}\n... [truncated]"
         return content.hex()
-    
+
     def _format_response_body(self, text: str, content: bytes) -> str:
-        """格式化响应体 - 显示完整内容"""
+        """格式化响应体 - 进入任何解码前先判长度，超限直接返回截断预览
+
+        【修复】httpx 的 response.text 是 content.decode(errors='replace')，
+        对任意字节都产出非空 str，原实现直接返回全文，任意大响应全量进入 TrafficLog。
+        """
         if text:
+            # 【修复】文本路径同样先判长度，超限截断并标注总字节数
+            if len(text) > 32768:
+                total = len(content) if content else len(text)
+                return text[:32768] + f"\n... [truncated, total {total} bytes]"
             # 返回完整文本内容
             return text
-        
+
         # 尝试解码二进制内容
         if content:
+            # 【修复】先判长度：超过 32KB 直接截断
+            if len(content) > 32768:
+                return _truncate_bytes_preview(content)
+
             # 尝试UTF-8解码
             try:
                 decoded = content.decode('utf-8')
                 return decoded
             except:
                 pass
-            
+
             # 尝试Latin-1解码
             try:
                 decoded = content.decode('latin-1')
                 return decoded
             except:
                 pass
-            
+
             # 尝试GBK解码
             try:
                 decoded = content.decode('gbk')
                 return decoded
             except:
                 pass
-            
+
             # 作为十六进制显示（增大预览，便于分析较大二进制响应）
             if len(content) > 32768:
                 hex_content = content[:32768].hex()
                 return f"[Binary Content - {len(content)} bytes, showing first 32KB]\n{hex_content}\n... [truncated]"
             return content.hex()
-        
+
         return ""
     
     def _log_traffic(self, response: httpx.Response, request_body: bytes = b"") -> Optional[TrafficLog]:
@@ -148,10 +207,24 @@ class AsyncHTTPClient:
             
             # 处理请求体 - 显示完整内容
             req_body = self._format_request_body(request_body)
-            
+
             # 处理响应体 - 显示完整内容
             res_body = self._format_response_body(response.text, response.content)
-            
+
+            # 【修复 P2】字节字段统一 1MB 封顶：文本已截 32KB，但 bytes/raw 字段
+            # 无上限，大响应全量驻留内存（TrafficLog 每条都进 GUI 队列）。
+            _BYTES_CAP = 1_048_576
+            _resp_bytes = response.content or b""
+            if len(_resp_bytes) > _BYTES_CAP:
+                _resp_bytes = _resp_bytes[:_BYTES_CAP]
+            _req_raw = (
+                f"{response.request.method} {response.request.url.raw_path.decode('ascii', errors='replace')} HTTP/1.1\r\n".encode("latin-1")
+                + "\r\n".join(f"{k}: {v}" for k, v in response.request.headers.items()).encode("latin-1", errors="replace")
+                + b"\r\n\r\n" + request_body
+            )
+            if len(_req_raw) > _BYTES_CAP:
+                _req_raw = _req_raw[:_BYTES_CAP]
+
             log = TrafficLog(
                 id=self.request_counter,
                 timestamp=datetime.now().strftime("%H:%M:%S"),
@@ -162,12 +235,8 @@ class AsyncHTTPClient:
                 request_body=req_body,
                 response_headers=res_headers,
                 response_body=res_body,
-                response_body_bytes=response.content or b"",
-                request_raw=(
-                    f"{response.request.method} {response.request.url.raw_path.decode('ascii', errors='replace')} HTTP/1.1\r\n".encode("latin-1")
-                    + "\r\n".join(f"{k}: {v}" for k, v in response.request.headers.items()).encode("latin-1", errors="replace")
-                    + b"\r\n\r\n" + request_body
-                ),
+                response_body_bytes=_resp_bytes,
+                request_raw=_req_raw,
             )
             self.last_traffic_log = log
             self.log_callback(log)

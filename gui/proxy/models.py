@@ -11,6 +11,7 @@ class ProxySignals(QObject):
     response_received = Signal(object, object)  # 收到响应
     request_logged = Signal(object)  # 请求被记录
     status_changed = Signal(str)  # 状态改变
+    flow_timeout = Signal(str)  # 【新增】拦截超时自动放行，参数为 flow_id，通知 GUI 移除对应行
 
 
 class InterceptedFlow:

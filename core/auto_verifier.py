@@ -12,6 +12,7 @@ import json
 from typing import Optional, Tuple, List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+from urllib.parse import urlparse
 
 
 class VerificationStatus(Enum):
@@ -70,35 +71,70 @@ class WebShellVerifier:
     }
     
     def __init__(self, timeout: int = 10, proxy: Optional[str] = None,
-                 proxies: Optional[Dict] = None, verify_ssl: bool = True):
+                 proxies: Optional[Dict] = None, verify_ssl: bool = True,
+                 marker: str = "UR_TEST_46"):
         self.timeout = timeout
         # 同时兼容旧版 proxy= 与多协议 proxies= 调用方。
         if proxies is None and proxy:
             proxies = {"http://": proxy, "https://": proxy}
         self.proxies = proxies or {}
         self.verify_ssl = verify_ssl
-    
+        # 【修复】硬编码特征串 UR_TEST_46 提为构造参数（默认值保持旧行为兼容）。
+        # 上传测试代码与判定特征统一使用该参数：自定义 marker（如每轮唯一
+        # nonce）时三者同步变化，避免固定特征串被静态回显伪造执行证据。
+        self.marker = marker
+        self.test_patterns = {
+            "php": {
+                "code": f"<?php echo '{self.marker}'; ?>",
+                "pattern": re.escape(self.marker),
+                "marker": self.marker,
+            },
+            "asp": {
+                "code": f"<% Response.Write '{self.marker}' %>",
+                "pattern": re.escape(self.marker),
+                "marker": self.marker,
+            },
+            "aspx": {
+                "code": '<%@ Page Language="C#" %> <% Response.Write("'
+                        + self.marker + '"); %>',
+                "pattern": re.escape(self.marker),
+                "marker": self.marker,
+            },
+            "jsp": {
+                "code": '<% out.println("' + self.marker + '"); %>',
+                "pattern": re.escape(self.marker),
+                "marker": self.marker,
+            },
+        }
+
+    def get_test_code(self, language: str = "php") -> str:
+        """返回指定语言的上传测试代码（内容基于构造参数 marker）"""
+        pattern = self.test_patterns.get((language or "php").lower()) or self.test_patterns["php"]
+        return pattern["code"]
+
     async def verify(self, upload_url: str, language: str = "php") -> VerificationResult:
         """
         验证上传的WebShell是否可执行
-        
+
         Args:
             upload_url: 上传后获得的URL
             language: 语言类型 (php/asp/aspx/jsp)
-            
+
         Returns:
             VerificationResult: 验证结果
+
+        Raises:
+            ValueError: upload_url 不是 http/https 绝对地址（相对 URL 无法直接
+                请求，httpx 会抛未捕获的 InvalidURL，这里显式拒绝并给出清晰错误）
         """
         # 解析URL
         parsed = self._parse_upload_url(upload_url)
         if not parsed:
-            return VerificationResult(
-                status=VerificationStatus.FAILED,
-                verified_url=None,
-                response_code=0,
-                response_preview="",
-                execution_confirmed=False,
-                error="无法解析上传URL"
+            # 【修复】相对 URL（如 /uploads/x.php）不再原样请求——那会抛未捕获
+            # 的 httpx.InvalidURL；这里显式拒绝并给出可操作的错误信息。
+            raise ValueError(
+                f"无法解析上传URL: {upload_url!r}；需要以 http:// 或 https:// "
+                f"开头的完整地址（相对路径请先与目标站点 base_url 拼接）"
             )
         
         verify_url, filename = parsed
@@ -148,19 +184,27 @@ class WebShellVerifier:
         return await asyncio.gather(*tasks)
     
     def _parse_upload_url(self, upload_url: str) -> Optional[Tuple[str, str]]:
-        """解析上传URL"""
-        # 如果是完整URL
-        if upload_url.startswith('http'):
+        """解析上传URL
+
+        【修复】只接受 http/https 绝对地址；相对路径（/uploads/x.php）或纯文件名
+        返回 None，由 verify() 抛出清晰的 ValueError 拒绝。
+        scheme 判断从 startswith('http') 改为 urlparse 后按 scheme 判定，
+        避免放过 'httpfoo' 之类的输入。
+        """
+        text = str(upload_url or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = urlparse(text)
+        except ValueError:
+            return None
+        # 如果是完整URL（scheme 必须是 http/https 且带主机）
+        if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
             # 提取文件名
-            filename = upload_url.split('/')[-1].split('?')[0]
-            return upload_url, filename
-        
-        # 如果是相对路径
-        if upload_url.startswith('/'):
-            return upload_url, upload_url.split('/')[-1]
-        
-        # 如果只有文件名
-        return None, upload_url
+            filename = text.split('/')[-1].split('?')[0]
+            return text, filename
+        # 相对路径/纯文件名：无法直接请求
+        return None
     
     def _check_response(self, 
                         status_code: int, 
@@ -191,13 +235,18 @@ class WebShellVerifier:
             )
         
         # 检查是否是执行输出
-        test_pattern = self.TEST_PATTERNS.get(language.lower(), self.TEST_PATTERNS["php"])
-        
-        if re.search(test_pattern["pattern"], content):
-            # 提取执行输出
-            match = re.search(rf'{test_pattern["marker"]}(\d+)', content)
-            output = match.group(0) if match else "UR_TEST_46"
-            
+        # 【修复】判定统一使用构造参数 marker（上传测试代码与判定同源）；
+        # 自定义 marker 时按字面匹配，默认 UR_TEST_46 保持旧的正则兼容回退。
+        patterns = getattr(self, "test_patterns", None) or self.TEST_PATTERNS
+        test_pattern = patterns.get(language.lower()) or patterns.get("php") or self.TEST_PATTERNS["php"]
+        marker_hit = bool(self.marker) and self.marker in content
+        legacy_hit = bool(re.search(test_pattern["pattern"], content))
+
+        if marker_hit or legacy_hit:
+            # 提取执行输出（旧特征 UR_TEST_<数字> 仍可提取；nonce 化 marker 原样返回）
+            match = re.search(rf'{re.escape(test_pattern["marker"])}\d*', content)
+            output = match.group(0) if match else (self.marker or "UR_TEST_46")
+
             return VerificationResult(
                 status=VerificationStatus.VERIFIED_EXEC,
                 verified_url=url,

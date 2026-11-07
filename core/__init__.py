@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Core 模块 - UploadRanger核心功能
@@ -6,7 +6,6 @@ Core 模块 - UploadRanger核心功能
 
 from .async_scanner import AsyncScanner
 from .async_http_client import AsyncHTTPClient
-from .smart_analyzer import SmartResponseAnalyzer
 from .fingerprinter import EnvironmentFingerprinter, EnvironmentProfile
 
 try:
@@ -24,7 +23,6 @@ except ImportError:
 __all__ = [
     'AsyncScanner',
     'AsyncHTTPClient',
-    'SmartResponseAnalyzer',
     'EnvironmentFingerprinter',
     'EnvironmentProfile',
 ]

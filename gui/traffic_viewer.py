@@ -5,6 +5,8 @@
 支持分割器调整大小，完整内容显示，语法高亮
 """
 
+from collections import deque
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
     QTableWidgetItem, QSplitter, QLabel, 
@@ -60,7 +62,8 @@ class TrafficViewer(QWidget):
     
     def __init__(self):
         super().__init__()
-        self.logs = []
+        # 【修复】历史记录加容量上限（deque 自动淘汰最旧条目），防止大响应长期驻留内存
+        self.logs = deque(maxlen=5000)
         self.current_log = None
         self.init_ui()
     
@@ -356,7 +359,7 @@ class TrafficViewer(QWidget):
     
     def clear_logs(self):
         """清除所有日志"""
-        self.logs = []
+        self.logs.clear()
         self.table.setRowCount(0)
         self.req_text.clear()
         self.res_viewer.clear()
@@ -368,7 +371,12 @@ class TrafficViewer(QWidget):
     
     def add_log(self, log):
         """添加流量日志"""
+        # 【修复】达到容量上限时 deque 会淘汰最旧条目，同步移除表格首行，
+        # 保持表格行号与 self.logs 索引始终对齐
+        evict_oldest = bool(self.logs.maxlen) and len(self.logs) >= self.logs.maxlen
         self.logs.append(log)
+        if evict_oldest:
+            self.table.removeRow(0)
         row = self.table.rowCount()
         self.table.insertRow(row)
         

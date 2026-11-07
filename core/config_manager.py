@@ -5,8 +5,10 @@
 支持JSON格式配置文件，存储在用户目录下
 """
 
+import copy
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -27,23 +29,41 @@ class ConfigManager:
         self.config_dir.mkdir(parents=True, exist_ok=True)
     
     def load(self) -> Dict[str, Any]:
-        """加载配置文件"""
+        """加载配置文件（与默认值深合并：手工编辑缺键时回退默认值而不是返回 None）"""
+        loaded = {}
         if self.config_file.exists():
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
-                    self._config = json.load(f)
+                    loaded = json.load(f)
             except Exception as e:
                 print(f"加载配置文件失败: {e}")
-                self._config = self._get_default_config()
-        else:
-            self._config = self._get_default_config()
+                loaded = {}
+        if not isinstance(loaded, dict):
+            loaded = {}
+        self._config = self._deep_merge(self._get_default_config(), loaded)
         return self._config
-    
+
+    @staticmethod
+    def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+        """递归合并：override 优先，缺键回退 base"""
+        merged = dict(base)
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = ConfigManager._deep_merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
     def save(self) -> bool:
-        """保存配置到文件"""
+        """保存配置到文件（POSIX 下收紧为 0600，避免同机用户读取）"""
         try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self._config, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(self.config_file, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass  # Windows 无 POSIX 权限位，忽略
             return True
         except Exception as e:
             print(f"保存配置文件失败: {e}")
@@ -116,8 +136,8 @@ class ConfigManager:
     
     @property
     def config(self) -> Dict[str, Any]:
-        """获取完整配置"""
-        return self._config.copy()
+        """获取完整配置（深拷贝，避免调用方修改嵌套值写穿内部状态）"""
+        return copy.deepcopy(self._config)
 
 
 # 全局配置管理器实例

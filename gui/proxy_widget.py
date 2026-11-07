@@ -13,15 +13,18 @@
 本文件仅保留 ProxyWidget 主容器类，以维持向后兼容的 import 路径。
 """
 
+import threading
 import time
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
-    QPushButton, QLabel, QTabWidget, QCheckBox, QMessageBox
+    QPushButton, QLabel, QTabWidget, QCheckBox, QMessageBox,
+    QGroupBox
 )
 from PySide6.QtCore import Qt, Signal
 
 from .themes.dark_theme import COLORS
-from core.config_manager import ConfigManager
+from core.config_manager import ConfigManager, get_config_manager
+from core.proxy_config import ProxyConfig
 
 # 从子包导入各组件
 from .proxy.models import ProxySignals, InterceptedFlow
@@ -43,12 +46,14 @@ class ProxyWidget(QWidget):
     send_to_repeater = Signal(object)
     send_to_intruder = Signal(object)
     send_to_scanner = Signal(object)
+    upstream_test_done = Signal(dict)  # 【新增】上游代理连通性测试结果（后台线程 → 主线程）
 
     def __init__(self):
         super().__init__()
         self.proxy_thread = None
         self._is_toggling = False
         self.config_manager = ConfigManager()
+        self.upstream_test_done.connect(self._on_upstream_test_done)
         self.init_ui()
         self._load_config()
 
@@ -95,6 +100,44 @@ class ProxyWidget(QWidget):
         control_layout.addWidget(self.intercept_cb)
         control_layout.addStretch()
         layout.addLayout(control_layout)
+
+        # 【新增】上游代理分组（Issue #8：浏览器 → 本代理 → 上游代理 → 内网目标）
+        upstream_group = QGroupBox("上游代理")
+        upstream_group.setStyleSheet(f"""
+            QGroupBox {{
+                font-weight: bold;
+                color: {COLORS['accent']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 6px;
+                margin-top: 12px;
+                padding-top: 10px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 8px;
+            }}
+        """)
+        upstream_layout = QHBoxLayout(upstream_group)
+        upstream_layout.setContentsMargins(10, 5, 10, 8)
+        upstream_layout.setSpacing(10)
+
+        self.upstream_cb = QCheckBox("启用上游代理")
+        self.upstream_cb.setStyleSheet(f"color: {COLORS['text_primary']};")
+        upstream_layout.addWidget(self.upstream_cb)
+
+        self.upstream_input = QLineEdit()
+        self.upstream_input.setPlaceholderText(
+            "http://user:pass@10.0.0.2:8080 或 socks5://ip:1080")
+        self.upstream_input.setStyleSheet(_input_style)
+        upstream_layout.addWidget(self.upstream_input, 1)
+
+        self.upstream_test_btn = QPushButton("测试连通")
+        self._apply_btn_style(self.upstream_test_btn, COLORS['accent'], COLORS['accent_hover'])
+        self.upstream_test_btn.clicked.connect(self._test_upstream)
+        upstream_layout.addWidget(self.upstream_test_btn)
+
+        layout.addWidget(upstream_group)
 
         # 状态栏
         self.status_label = QLabel("代理未启动")
@@ -161,17 +204,33 @@ class ProxyWidget(QWidget):
                 try:
                     host = self.host_input.text() or "127.0.0.1"
                     port = int(self.port_input.text() or 8080)
-                    self.proxy_thread = ProxyThread(host, port)
+                    # 【新增】Issue #8: 启用上游代理时把归一化 URL 传给代理线程（非法格式弹窗阻止启动，堵静默直连）
+                    upstream_url = ""
+                    upstream_pc = None
+                    if self.upstream_cb.isChecked():
+                        upstream_pc = self._parse_upstream()
+                        if upstream_pc is None:
+                            return
+                        upstream_url = upstream_pc.url
+                    self.proxy_thread = ProxyThread(host, port, upstream_url=upstream_url)
                     self.proxy_thread.signals.request_intercepted.connect(self._on_intercepted)
                     self.proxy_thread.signals.request_logged.connect(self._on_logged)
                     self.proxy_thread.signals.response_received.connect(self._on_response)
                     self.proxy_thread.signals.status_changed.connect(self._on_status_changed)
+                    # 【新增】拦截超时自动放行时，由 addon 通知拦截面板移除对应行
+                    self.proxy_thread.signals.flow_timeout.connect(
+                        self.intercept_tab.remove_intercepted_flow)
                     self.proxy_thread.set_intercept(self.intercept_cb.isChecked())
                     self.proxy_thread.start()
                     self.start_btn.setText("停止代理")
                     self._apply_btn_style(self.start_btn, COLORS['danger'], '#dc2626')
                     self.intercept_tab.proxy_thread = self.proxy_thread
                     self.history_tab.proxy_thread = self.proxy_thread
+                    # 【新增】持久化上游代理配置（启用状态 + 归一化地址）
+                    if upstream_pc is not None:
+                        self._save_upstream_config(upstream_pc, enabled=True)
+                    else:
+                        self._save_upstream_config(enabled=False)
                 except Exception as e:
                     self.status_label.setText(f"启动失败: {e}")
                     self.status_label.setStyleSheet(f"color: {COLORS['danger']}; padding: 5px;")
@@ -185,29 +244,35 @@ class ProxyWidget(QWidget):
     def _stop_proxy_thread(self):
         if self.proxy_thread:
             self.proxy_thread.stop()
+            # 【修复 P2】删除 terminate() 兜底（对跑 asyncio 事件循环的线程强杀
+            # 极危险且审计 05 号已论证），超时改由 ProxyThread.stop() 内部的
+            # loop.stop 兜底完成；进程退出仅延迟至线程自然收尾。
             if not self.proxy_thread.wait(5000):
-                self.proxy_thread.terminate()
-                self.proxy_thread.wait(1000)
+                self._log_proxy_stop_timeout()
             self.proxy_thread = None
         self.intercept_tab.proxy_thread = None
         self.history_tab.proxy_thread = None
         self.intercept_tab.clear_intercepted()
+
+    def _log_proxy_stop_timeout(self):
+        try:
+            self.status_label.setText("代理停止超时（后台线程仍在收尾）")
+        except Exception:
+            pass
 
     def _cleanup_old_thread(self):
         if self.proxy_thread:
             self.proxy_thread.stop()
             if self.proxy_thread.isRunning():
                 self.proxy_thread.wait(5000)
-            if self.proxy_thread.isRunning():
-                self.proxy_thread.terminate()
-                self.proxy_thread.wait(1000)
+            # 【修复 P2】同上：不再 terminate 强杀
             self.proxy_thread = None
-            time.sleep(1.0)
+            time.sleep(0.3)
 
     def stop_proxy(self):
         """外部调用：停止代理线程"""
         self._stop_proxy_thread()
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     # ------------------------------------------------------------------
     # 信号处理
@@ -255,6 +320,8 @@ class ProxyWidget(QWidget):
         self.port_input.setText(str(cfg.get('port', 8080)))
         self.intercept_cb.setChecked(cfg.get('intercept', True))
         self.history_tab.load_filter_config()
+        # 【新增】回填上游代理输入框与勾选状态
+        self._load_upstream_config()
 
     def _save_config(self):
         if not self.config_manager:
@@ -269,6 +336,76 @@ class ProxyWidget(QWidget):
             self.intercept_cb.isChecked()
         )
         self.config_manager.save()
+
+    # ------------------------------------------------------------------
+    # 上游代理（Issue #8）
+    # ------------------------------------------------------------------
+
+    def _parse_upstream(self):
+        """读取并解析上游代理输入；非法时弹窗提示并返回 None（堵静默直连）"""
+        raw = self.upstream_input.text().strip()
+        if not raw:
+            QMessageBox.warning(self, "上游代理", "已启用上游代理，但地址为空")
+            return None
+        try:
+            return ProxyConfig.parse(raw)
+        except ValueError as e:
+            QMessageBox.warning(self, "上游代理格式错误", str(e))
+            return None
+
+    def _test_upstream(self):
+        """测试上游代理连通性：解析 → 后台线程探测 → 信号回主线程弹结果"""
+        pc = self._parse_upstream()
+        if pc is None:
+            return
+        self.upstream_test_btn.setEnabled(False)
+        self.upstream_test_btn.setText("测试中...")
+        # test_connectivity 为阻塞网络调用，放后台线程执行，避免冻结 GUI
+        threading.Thread(
+            target=lambda: self.upstream_test_done.emit(pc.test_connectivity()),
+            daemon=True
+        ).start()
+
+    def _on_upstream_test_done(self, result: dict):
+        """连通性测试结果回主线程展示"""
+        self.upstream_test_btn.setEnabled(True)
+        self.upstream_test_btn.setText("测试连通")
+        if result.get("ok"):
+            msg = f"连通正常\n延迟: {result.get('latency_ms')} ms"
+            if result.get("exit_ip"):
+                msg += f"\n出口 IP: {result['exit_ip']}"
+            QMessageBox.information(self, "上游代理测试", msg)
+        else:
+            QMessageBox.warning(
+                self, "上游代理测试失败",
+                f"错误: {result.get('error') or '未知错误'}")
+
+    def _save_upstream_config(self, pc: ProxyConfig = None, enabled: bool = None):
+        """持久化上游代理配置：启用状态 + 归一化地址（no_proxy 无 UI，固定空列表）
+
+        统一走全局 ConfigManager 单例（与 ProxyConfig.save 内部一致），避免双实例互相覆盖。
+        """
+        try:
+            cm = get_config_manager()
+            if enabled is not None:
+                cm.set("upstream_proxy_enabled", bool(enabled))
+            if pc is not None:
+                pc.no_proxy = []
+                cm.set("upstream_proxy", pc.to_config_dict())
+            cm.save()
+        except Exception:
+            pass
+
+    def _load_upstream_config(self):
+        """启动时回填上游代理输入框与勾选状态"""
+        try:
+            cm = get_config_manager()
+            self.upstream_cb.setChecked(bool(cm.get("upstream_proxy_enabled", False)))
+            pc = ProxyConfig.load_saved()
+            if pc:
+                self.upstream_input.setText(pc.url)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 工具方法

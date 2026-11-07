@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextEdit,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QSplitter, QGroupBox, QCheckBox, QPlainTextEdit,
-    QMenu
+    QMenu, QApplication
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
@@ -15,6 +15,9 @@ from gui.themes.dark_theme import COLORS
 from gui.syntax_highlighter import HTTPHighlighter
 from .models import InterceptedFlow
 from .proxy_thread import ProxyThread
+
+# 拦截列表容量上限：超限淘汰最旧行，保持 self.intercepted_list 与表格行号对齐
+MAX_INTERCEPTS = 5000
 
 class ProxyInterceptTab(QWidget):
     """代理拦截标签页"""
@@ -245,6 +248,11 @@ class ProxyInterceptTab(QWidget):
     
     def add_intercepted(self, intercepted: InterceptedFlow):
         """添加拦截请求"""
+        # 【修复】达到容量上限时淘汰最旧记录，保持 self.intercepted_list 与表格行号对齐
+        if len(self.intercepted_list) >= MAX_INTERCEPTS:
+            self.intercepted_list.pop(0)
+            self.intercept_table.removeRow(0)
+
         self.intercepted_list.append(intercepted)
         
         row = self.intercept_table.rowCount()
@@ -361,24 +369,59 @@ class ProxyInterceptTab(QWidget):
             self.send_to_scanner.emit(self.intercepted_list[row].to_dict())
     
     def _forward(self):
-        """放行请求 - 【修复】自动选择下一个请求"""
+        """放行请求 - 【修复】解析编辑器完整请求文本并整体重建（编辑器为完整请求文本，含请求行与头）
+
+        解析结果（method、path、headers dict、body bytes）经 forward_request 传给
+        addon.handle_action 全量重建 flow.request，用户对头/路径的修改不再被静默丢弃。
+        注意：Qt 文本框会把 CRLF 归一为 \\n，body 重建时转回 \\r\\n 保持 HTTP 语义。
+        """
         if self.current_flow_id and self.proxy_thread:
             modified_text = self.request_edit.toPlainText()
-            
+
+            method = None
+            path = None
+            headers = None
+            modified_content = None
+
             try:
                 lines = modified_text.split('\n')
-                body_start = 0
-                for i, line in enumerate(lines[1:], 1):
-                    if line.strip() == '':
-                        body_start = i + 1
-                        break
-                
-                body = '\n'.join(lines[body_start:]) if body_start > 0 else ''
-                modified_content = body.encode('utf-8') if body else None
-            except:
+                if lines and lines[0].strip():
+                    # 第一行：METHOD 路径 HTTP/1.1（路径可能是完整 URL，addon 侧归一）
+                    parts = lines[0].strip().split()
+                    if len(parts) >= 2:
+                        method = parts[0].upper()
+                        path = parts[1]
+
+                    # 后续头行解析为 headers dict
+                    headers = {}
+                    body_start = len(lines)
+                    for i, line in enumerate(lines[1:], 1):
+                        if line.strip() == '':
+                            body_start = i + 1
+                            break
+                        if ':' in line:
+                            k, _, v = line.partition(':')
+                            headers[k.strip()] = v.strip()
+
+                    # 空行之后为 body 段；无空行表示纯头请求，不触碰原 content
+                    if body_start < len(lines):
+                        body_text = '\n'.join(lines[body_start:])
+                        # 编辑器文本为 \n，重建时转回 \r\n
+                        modified_content = (body_text
+                                            .replace('\r\n', '\n')
+                                            .replace('\n', '\r\n')
+                                            .encode('utf-8'))
+            except Exception:
+                # 解析失败时退回旧行为：仅透传原 content，不重建
+                method = None
+                path = None
+                headers = None
                 modified_content = None
-            
-            self.proxy_thread.forward_request(self.current_flow_id, modified_content)
+
+            self.proxy_thread.forward_request(
+                self.current_flow_id, modified_content,
+                method=method, path=path, headers=headers,
+            )
             
             # 从列表中移除并获取当前行号
             removed_row = -1
@@ -492,6 +535,36 @@ class ProxyInterceptTab(QWidget):
         has_unreleased = any(not f.released for f in self.intercepted_list)
         self.forward_all_btn.setEnabled(has_unreleased)
     
+    def remove_intercepted_flow(self, flow_id: str):
+        """【新增】移除指定拦截行 - addon 拦截超时自动放行时经 flow_timeout 信号通知调用
+
+        若被移除的是当前选中项，自动选中下一个（与 _forward 的处理一致）；
+        移除非当前项时不打扰用户当前的选择。
+        """
+        removed_row = -1
+        for i, intercepted in enumerate(self.intercepted_list):
+            if intercepted.id == flow_id:
+                intercepted.released = True
+                removed_row = i
+                self.intercept_table.removeRow(i)
+                self.intercepted_list.pop(i)
+                break
+
+        if removed_row < 0 or self.current_flow_id != flow_id:
+            return
+
+        if self.intercepted_list:
+            next_row = min(removed_row, len(self.intercepted_list) - 1)
+            self.intercept_table.selectRow(next_row)
+            self._on_item_selected(self.intercept_table.item(next_row, 0))
+        else:
+            # 没有更多请求，清空编辑区
+            self.request_edit.clear()
+            self.current_flow_id = None
+            self.forward_btn.setEnabled(False)
+            self.drop_btn.setEnabled(False)
+            self.forward_all_btn.setEnabled(False)
+
     def clear_intercepted(self):
         """【新增】清空所有拦截的请求"""
         # 丢弃所有未释放的请求

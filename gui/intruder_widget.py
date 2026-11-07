@@ -22,6 +22,7 @@ from PySide6.QtGui import QColor, QFont, QTextCursor, QKeySequence
 
 from .themes.dark_theme import COLORS
 from .syntax_highlighter import HTTPHighlighter
+from .repeater_widget import global_proxy_mounts
 
 
 class _NoFocusStyle(QProxyStyle):
@@ -82,16 +83,21 @@ class IntruderWorker(QThread):
         import sys
         try:
             self._loop = asyncio.new_event_loop()
-            
+
             # Linux 环境使用 Selector
             if sys.platform.startswith('linux'):
                 self._loop = asyncio.SelectorEventLoop()
-            
+
             asyncio.set_event_loop(self._loop)
             self._loop.run_until_complete(self._attack())
         except Exception as e:
             self.error_signal.emit(str(e))
         finally:
+            # 【修复 P3】无论正常完成、提前 return（无标记/零请求）还是异常，
+            # finished_signal 必须恰好发一次——否则 GUI 侧按钮卡死、排序不恢复。
+            # 正常路径 _attack 的 try/finally 里已发过，这里用标志去重。
+            if not getattr(self, '_finished_emitted', False):
+                self.finished_signal.emit()
             if self._loop and not self._loop.is_closed():
                 try:
                     self._loop.close()
@@ -116,23 +122,43 @@ class IntruderWorker(QThread):
         if not positions:
             self.error_signal.emit("未找到payload位置，请使用 § § 标记")
             return
-        
+
         requests = self._generate_requests(url, headers, body, positions)
         total = len(requests)
-        
+
         if total == 0:
             self.error_signal.emit("没有生成任何请求")
             return
-        
+        # 【修复 P2】cluster bomb 总量上限：全量物化请求 + 全部并发任务在大字典
+        # 组合下会内存暴涨/UI 卡死。超限直接报错终止（惰性生成列入待办）。
+        if total > 20000:
+            self.error_signal.emit(
+                f"请求总数 {total} 超过上限 20000（payload 组合过大），"
+                "请缩减 payload 集合或减少标记位置后重试"
+            )
+            return
+
+        self._finished_emitted = False
         semaphore = asyncio.Semaphore(max(1, self.threads))
         completed = [0]
         lock = asyncio.Lock()
+        
+        # 【修复】整个攻击共享一个 AsyncClient，避免每个 payload 重新 TCP/TLS 握手
+        # （爆破场景 10 线程 × 几千 payload 时性能损失巨大）；同时接全局上游代理。
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        client = httpx.AsyncClient(
+            verify=True,
+            timeout=15,
+            follow_redirects=self.follow_redirects,
+            limits=limits,
+            mounts=global_proxy_mounts(),
+        )
         
         async def send_request_with_limit(idx, req_data):
             async with semaphore:
                 if not self._is_running:
                     return
-                result = await self._send_single_request(method, req_data)
+                result = await self._send_single_request(method, req_data, client)
                 result['index'] = idx
                 result['payload'] = req_data.get('payload_info', '')
                 self.result_ready.emit(result)
@@ -148,7 +174,13 @@ class IntruderWorker(QThread):
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            self._finished_emitted = True  # 标记已发，run() finally 去重
             self.finished_signal.emit()
+            # 统一释放共享连接池
+            try:
+                await client.aclose()
+            except Exception:
+                pass
     
     def _get_payload_positions(self, url: str, headers: dict, body: str) -> List[Tuple[str, int, int]]:
         positions = []
@@ -241,15 +273,22 @@ class IntruderWorker(QThread):
         new_url = url
         new_body = body
 
+        # 【修复】Sniper 语义与 Burp 一致：非目标位置回填原始文本（去掉 § 标记）而不是空串。
+        # 否则多字段 multipart 请求里测字段 B 时字段 A 会被整体删除，服务端行为随之失真。
+        original_values = {
+            i: (url if pos_type == 'url' else body)[start + 1:end - 1]
+            for i, (pos_type, start, end) in enumerate(positions)
+        }
+
         # Process all positions in reverse order to avoid index corruption.
-        # Target position is replaced with payload; other positions are removed (empty string).
+        # Target position is replaced with payload; other positions keep their original text.
         all_positions = sorted(
             [(i, pos_type, start, end) for i, (pos_type, start, end) in enumerate(positions)],
             key=lambda x: x[2], reverse=True
         )
 
         for i, pos_type, start, end in all_positions:
-            replacement = payload if i == target_idx else ''
+            replacement = payload if i == target_idx else original_values[i]
             if pos_type == 'url':
                 new_url = new_url[:start] + replacement + new_url[end:]
             else:
@@ -296,7 +335,7 @@ class IntruderWorker(QThread):
 
         return {'url': new_url, 'headers': headers, 'body': new_body}
     
-    async def _send_single_request(self, method: str, req_data: dict) -> dict:
+    async def _send_single_request(self, method: str, req_data: dict, client: "httpx.AsyncClient" = None) -> dict:
         url = req_data['url']
         headers = req_data['headers']
         body = req_data['body']
@@ -310,43 +349,56 @@ class IntruderWorker(QThread):
             request_lines.append(body if isinstance(body, str) else body.decode('utf-8', errors='replace'))
         request_str = "\n".join(request_lines)
         
+        # 【修复】复用 _attack 创建的共享 AsyncClient；无 client 时兜底自建（兼容旧调用）
+        owns_client = client is None
+        if owns_client:
+            client = httpx.AsyncClient(verify=True, timeout=15, follow_redirects=self.follow_redirects)
+        
         try:
-            async with httpx.AsyncClient(verify=True, timeout=15, follow_redirects=self.follow_redirects) as client:
-                request_kwargs = {'headers': headers}
-                if body:
-                    if isinstance(body, str):
-                        request_kwargs['content'] = body.encode('utf-8')
-                    else:
-                        request_kwargs['content'] = body
-                
-                if method == 'GET':
-                    response = await client.get(url, **request_kwargs)
-                elif method == 'POST':
-                    response = await client.post(url, **request_kwargs)
-                elif method == 'PUT':
-                    response = await client.put(url, **request_kwargs)
-                elif method == 'DELETE':
-                    response = await client.delete(url, **request_kwargs)
-                elif method == 'PATCH':
-                    response = await client.patch(url, **request_kwargs)
+            request_kwargs = {'headers': headers}
+            if body:
+                if isinstance(body, str):
+                    request_kwargs['content'] = body.encode('utf-8')
                 else:
-                    response = await client.request(method, url, **request_kwargs)
-                
-                # 构建响应头字符串
-                response_headers = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
-                
-                return {
-                    'status_code': response.status_code,
-                    'length': len(response.content),
-                    'body': response.text,
-                    'body_bytes': response.content,
-                    'headers': response_headers,
-                    'url': str(response.url),
-                    'redirect_location': response.headers.get('location', ''),
-                    'follow_redirects': self.follow_redirects,
-                    'request': request_str,  # 添加请求数据
-                    'error': ''
-                }
+                    request_kwargs['content'] = body
+            
+            if method == 'GET':
+                response = await client.get(url, **request_kwargs)
+            elif method == 'POST':
+                response = await client.post(url, **request_kwargs)
+            elif method == 'PUT':
+                response = await client.put(url, **request_kwargs)
+            elif method == 'DELETE':
+                response = await client.delete(url, **request_kwargs)
+            elif method == 'PATCH':
+                response = await client.patch(url, **request_kwargs)
+            else:
+                response = await client.request(method, url, **request_kwargs)
+            
+            # 构建响应头字符串
+            response_headers = "\n".join([f"{k}: {v}" for k, v in response.headers.items()])
+
+            # 【修复 P2】结果字节封顶：cluster_bomb 大字典时每行都驻留全量响应体
+            # 会内存暴涨；表格/详情展示 256KB 足够，完整原始响应不落表。
+            _body_text = response.text
+            _body_bytes = response.content
+            if len(_body_text) > 262144:
+                _body_text = _body_text[:262144] + "\n\n[已截断：仅保留前 256KB / 共 {} 字符]".format(len(response.text))
+            if len(_body_bytes) > 262144:
+                _body_bytes = _body_bytes[:262144]
+
+            return {
+                'status_code': response.status_code,
+                'length': len(response.content),
+                'body': _body_text,
+                'body_bytes': _body_bytes,
+                'headers': response_headers,
+                'url': str(response.url),
+                'redirect_location': response.headers.get('location', ''),
+                'follow_redirects': self.follow_redirects,
+                'request': request_str,  # 添加请求数据
+                'error': ''
+            }
         except Exception as e:
             return {
                 'status_code': 0, 
@@ -357,15 +409,24 @@ class IntruderWorker(QThread):
                 'request': request_str,  # 即使失败也返回请求
                 'error': str(e)
             }
+        finally:
+            # 兜底路径（自行创建的 client）由本函数负责关闭
+            if owns_client:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
 
 
 class IntruderTab(QWidget):
     """单个Intruder标签页"""
     
-    def __init__(self, tab_name: str = "Intruder"):
+    def __init__(self, tab_name: str = "Intruder", container=None):
         super().__init__()
         self.tab_name = tab_name
         self.worker = None
+        self._container = container  # IntruderWidget，用于运行中 worker 的生命周期托管
+        self._ref_url = ""  # 最近一次载入的完整 URL，供相对路径推断 http/https
         self.payload_sets = [[]]
         self.current_mode = "sniper"
         self.init_ui()
@@ -1069,11 +1130,23 @@ class IntruderTab(QWidget):
             host = headers.get('Host') or headers.get('host') or ''
             host = host.strip()
             if host:
-                scheme = 'http'
+                # 【修复】参照最近一次载入的 URL 推断协议，https 目标不再被硬编码按 http 发出
+                ref = (getattr(self, '_ref_url', '') or '').strip().lower()
+                scheme = 'https' if ref.startswith('https://') else 'http'
                 url = f"{scheme}://{host}{url}"
         return method, url, headers, body
     
     def _start_attack(self):
+        # 【修复】内部异常不再无声：此前 _start_attack 抛异常时 worker 未创建、
+        # 无任何提示（按钮态错乱、用户不知道为什么没反应）。统一捕获并上报。
+        try:
+            self._start_attack_inner()
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc(limit=6)
+            self.error_signal.emit(f"启动攻击失败: {e}\n{tb.splitlines()[-1] if tb else ''}")
+
+    def _start_attack_inner(self):
         # 先保存当前输入框中的payload到当前集合
         payloads_text = self.payload_input.toPlainText().strip()
         if payloads_text:
@@ -1130,6 +1203,9 @@ class IntruderTab(QWidget):
         self.worker.progress_update.connect(self._on_progress)
         self.worker.finished_signal.connect(self._on_finished)
         self.worker.error_signal.connect(self._on_error)
+        # 【修复】运行中 worker 移交容器持有，finished 后统一清理，
+        # 关标签/停止攻击时不再丢引用（防 QThread 运行中析构崩溃）
+        self._register_worker(self.worker)
         
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1138,12 +1214,50 @@ class IntruderTab(QWidget):
         
         self.worker.start()
     
+    def _register_worker(self, worker):
+        """把运行中的 worker 移交容器统一持有，线程退出后 discard + deleteLater。"""
+        container = getattr(self, '_container', None)
+        if container is None:
+            return
+        try:
+            container._running_workers.add(worker)
+        except Exception:
+            pass
+
+        def _cleanup():
+            try:
+                container._running_workers.discard(worker)
+            except Exception:
+                pass
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+        try:
+            # QThread 内建 finished（run() 返回后触发），此时 deleteLater 才安全
+            worker.finished.connect(_cleanup)
+        except Exception:
+            pass
+    
+    @staticmethod
+    def _disconnect_worker_signals(worker):
+        """断开 worker 指向本 tab 的全部信号：停止后残留信号会污染下一次攻击。"""
+        for signal in (worker.result_ready, worker.progress_update,
+                       worker.finished_signal, worker.error_signal):
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+    
     def _stop_attack(self):
-        if self.worker:
-            self.worker.stop()
-            # 不在 GUI 线程无限等待网络请求；worker 会在当前请求超时后自行结束。
-            if self.worker.isFinished():
-                self.worker = None
+        worker = getattr(self, 'worker', None)
+        if worker:
+            # 【修复】先断开全部信号再协作停止；引用移交 _running_workers 容器，
+            # 等 finished 回调清理，不在 isFinished 假设下置 None 丢引用。
+            self._disconnect_worker_signals(worker)
+            worker.stop()
+            self.worker = None
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText("已停止")
@@ -1195,6 +1309,8 @@ class IntruderTab(QWidget):
     def _on_finished(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        # 【修复】攻击前为防排序错位关闭了排序，结束后恢复
+        self.results_table.setSortingEnabled(True)
         self.progress_bar.setValue(self.progress_bar.maximum())
         self.status_label.setText("完成")
         self.status_label.setStyleSheet(f"color: {COLORS['success']}; font-weight: bold;")
@@ -1203,6 +1319,9 @@ class IntruderTab(QWidget):
         QMessageBox.critical(self, "错误", error_msg)
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        # 【修复 P3】错误路径同样要恢复排序与进度条（此前报错后排序永久关闭）
+        self.results_table.setSortingEnabled(True)
+        self.progress_bar.setValue(self.progress_bar.maximum())
         self.status_label.setText("错误")
         self.status_label.setStyleSheet(f"color: {COLORS['danger']};")
     
@@ -1295,6 +1414,8 @@ class IntruderTab(QWidget):
         """加载请求到Intruder"""
         method = request_data.get('method', 'GET')
         url = request_data.get('url', '')
+        # 记录完整 URL 供 _parse_request 对相对路径推断 http/https
+        self._ref_url = url
         headers = request_data.get('request_headers', '')
         body = request_data.get('request_body', '')
         
@@ -1310,6 +1431,9 @@ class IntruderWidget(QWidget):
         self._tab_counter = 1
         # 【修复】保存已关闭的 widget 引用，避免立即 deleteLater 导致崩溃
         self._closed_tabs = []
+        # 【修复】运行中 worker 的统一容器：关标签/停止攻击时移交到这里，
+        # finished 回调中 discard + deleteLater，防止 QThread 运行中被析构
+        self._running_workers = set()
         self._init_ui()
     
     def _init_ui(self):
@@ -1351,6 +1475,9 @@ class IntruderWidget(QWidget):
         self.tab_bar.tabCloseRequested.connect(self._on_tab_close_requested)
         self.tab_bar.currentChanged.connect(self._on_tab_changed)
         self.tab_bar.tabBarDoubleClicked.connect(self._on_tab_rename)
+        # 【修复】tab_bar 可拖动时必须同步 content_stack 的 widget 顺序，否则索引会错位
+        # （与 RepeaterWidget 的修复保持一致）
+        self.tab_bar.tabMoved.connect(self._on_tab_moved)
         layout.addWidget(self.tab_bar)
         
         # 内容区域
@@ -1366,7 +1493,7 @@ class IntruderWidget(QWidget):
             name = f"Intruder {self._tab_counter}"
         self._tab_counter += 1
         
-        tab = IntruderTab(name)
+        tab = IntruderTab(name, container=self)
         index = self.content_stack.addWidget(tab)
         tab_index = self.tab_bar.addTab(name)
         
@@ -1448,26 +1575,41 @@ class IntruderWidget(QWidget):
             traceback.print_exc()
     
     def _stop_tab_worker(self, tab: IntruderTab):
-        """安全停止 IntruderTab 的 worker"""
+        """安全停止 IntruderTab 的 worker：断开信号 + 协作停止，
+        引用移交 _running_workers 容器等 finished 回调清理，不在运行中丢弃引用。"""
         try:
             worker = getattr(tab, 'worker', None)
-            if worker and worker.isRunning():
-                # 断开信号
-                try:
-                    worker.result_ready.disconnect(tab._on_result)
-                except Exception:
-                    pass
-                try:
-                    worker.finished_signal.disconnect(tab._on_finished)
-                except Exception:
-                    pass
-                try:
-                    worker.error_signal.disconnect(tab._on_error)
-                except Exception:
-                    pass
-                # 停止 worker
-                worker.stop()
-                tab.worker = None
+            if not worker:
+                return
+            try:
+                tab._disconnect_worker_signals(worker)
+            except Exception:
+                pass
+            # 协作式停止；worker 已在 _start_attack 时登记进容器，
+            # 线程退出后由 finished 回调 discard + deleteLater
+            worker.stop()
+            tab.worker = None
+        except Exception:
+            pass
+    
+    def _on_tab_moved(self, from_index: int, to_index: int):
+        """同步 tab_bar 的拖动顺序到 content_stack（照抄 RepeaterWidget 的修复）"""
+        try:
+            if from_index == to_index:
+                return
+            if from_index < 0 or from_index >= self.content_stack.count():
+                return
+            w = self.content_stack.widget(from_index)
+            if w is None:
+                return
+            # 阻断信号
+            from PySide6.QtCore import QSignalBlocker
+            blocker = QSignalBlocker(self.content_stack)
+            try:
+                self.content_stack.removeWidget(w)
+                self.content_stack.insertWidget(to_index, w)
+            finally:
+                del blocker
         except Exception:
             pass
     

@@ -43,6 +43,10 @@ class AsyncScannerWorker(QThread):
         custom_payloads=None,
         strategy_mode="adaptive",
         resume_from=0,
+        smart_extensions=True,  # 【新增】智能后缀优选（接口契约：透传给 AsyncScanner.scan）
+        resume_order_sig="",  # 【新增】断点续扫的 payload 顺序签名（错位防护）
+        verify_ssl=True,  # 【新增】TLS 证书校验开关（自签名/证书链不完整靶场需关闭）
+        log_id_base=0,  # 【新增】流量日志 id 起始偏移（续扫续号防撞号）
     ):
         super().__init__()
         self.target_url = target_url
@@ -63,6 +67,10 @@ class AsyncScannerWorker(QThread):
         self.custom_payloads = custom_payloads or []
         self.strategy_mode = strategy_mode
         self.resume_from = resume_from
+        self.smart_extensions = smart_extensions
+        self.resume_order_sig = resume_order_sig
+        self.verify_ssl = verify_ssl
+        self.log_id_base = log_id_base
         self.scanner = AsyncScanner()
         
         # 确保信号连接正常工作
@@ -158,6 +166,10 @@ class AsyncScannerWorker(QThread):
                     custom_payloads=self.custom_payloads,
                     strategy_mode=self.strategy_mode,
                     resume_from=self.resume_from,
+                    smart_extensions=self.smart_extensions,
+                    resume_order_sig=self.resume_order_sig,
+                    verify_ssl=self.verify_ssl,
+                    log_id_base=self.log_id_base,
                 ))
                 
                 print(f"[AsyncScannerWorker] scanner.scan()完成")
@@ -207,33 +219,18 @@ class AsyncScannerWorker(QThread):
                 pass
     
     def stop(self):
-        """停止扫描 - 【BUG-9修复】移除 terminate()，避免资源泄露"""
+        """停止扫描 - 协作式停止：标记后当前请求完成、run() 自然结束。
+
+        GUI 线程不能在此 wait()（冻结 UI）；【清理】return 之后的旧兜底代码
+        为不可达死代码（wait/terminate 讨论段），已删除。
+        """
         try:
             self.progress.emit("正在停止扫描...")
             self.scanner.stop()
-            # GUI 线程不能在此 wait()；当前请求完成后 run() 会自然结束。
-            return
-            self.progress.emit("扫描器已标记停止，等待当前请求完成...")
-
-            if self.isRunning():
-                # 给当前进行中的请求一个完成机会（最多5秒）
-                if not self.wait(5000):
-                    # 超时后记录警告，但不强制 terminate()
-                    # terminate() 会绕过 Python finally 块，导致：
-                    #   1. asyncio 事件循环不关闭（内存泄露）
-                    #   2. RawHTTPClient socket 连接泄露
-                    #   3. 可能导致后续扫描状态不一致
-                    self.progress.emit("警告: 线程未在5秒内退出，已放弃等待（连接将随进程结束自动关闭）")
-                    print("[AsyncScannerWorker] 线程停止超时，放弃等待（不强制 terminate）")
-                else:
-                    self.progress.emit("线程已正常退出")
-            else:
-                self.progress.emit("线程已不在运行状态")
-
         except Exception as e:
             error_msg = f"停止worker时出错: {str(e)}"
             print(f"[AsyncScannerWorker] {error_msg}")
             try:
                 self.progress.emit(error_msg)
-            except:
-                pass  # 如果连信号都发不出去
+            except Exception:
+                pass

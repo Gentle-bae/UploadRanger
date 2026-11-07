@@ -21,10 +21,32 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QThread, Signal
 
+# 仍在运行的发现 worker 挂到模块级引用池，避免随宿主页面析构触发
+# "QThread: Destroyed while thread is still running" 硬崩溃。
+_ORPHAN_WORKERS = []
+
+
+def _park_worker(worker: QThread):
+    """把仍在运行的 worker 移交模块级引用，线程自然结束后释放。"""
+    _ORPHAN_WORKERS.append(worker)
+
+    def _release():
+        try:
+            _ORPHAN_WORKERS.remove(worker)
+        except ValueError:
+            pass
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+
+    worker.finished.connect(_release)
+
 
 class _DiscoverWorker(QThread):
     """后台线程发现上传点"""
-    finished = Signal(list)
+    # 【修复】不要覆盖 QThread 内建的 finished 信号名，改名 discover_done
+    discover_done = Signal(list)
     error = Signal(str)
     
     def __init__(self, url: str):
@@ -54,7 +76,7 @@ class _DiscoverWorker(QThread):
             # 解析表单
             from core.form_parser import FormParser
             items = FormParser.collect_upload_hints(target_url, html)
-            self.finished.emit(items)
+            self.discover_done.emit(items)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -133,15 +155,39 @@ class _TargetPage(QWizardPage):
         self._discovering = True
         
         self._worker = _DiscoverWorker(url)
-        self._worker.finished.connect(self._on_discover_ok)
+        self._worker.discover_done.connect(self._on_discover_ok)
         self._worker.error.connect(self._on_discover_err)
         self._worker.start()
+    
+    def _detach_worker(self):
+        """向导页销毁/完成时回收发现 worker：断开回调并移交模块级引用。
+
+        线程仍在跑时绝不让 QThread 随页面一起析构，否则触发
+        "QThread: Destroyed while thread is still running" 硬崩溃。
+        """
+        worker = getattr(self, '_worker', None)
+        if worker is None:
+            return
+        try:
+            worker.discover_done.disconnect(self._on_discover_ok)
+        except Exception:
+            pass
+        try:
+            worker.error.disconnect(self._on_discover_err)
+        except Exception:
+            pass
+        if worker.isRunning():
+            _park_worker(worker)
+        else:
+            worker.deleteLater()
+        self._worker = None
     
     def _on_discover_ok(self, items):
         """发现成功"""
         self._discover_btn.setEnabled(True)
         self._discover_btn.setText("发现上传点")
         self._discovering = False
+        self._detach_worker()
         
         if not items:
             QMessageBox.information(
@@ -163,6 +209,7 @@ class _TargetPage(QWizardPage):
         self._discover_btn.setEnabled(True)
         self._discover_btn.setText("发现上传点")
         self._discovering = False
+        self._detach_worker()
         QMessageBox.warning(self, "发现失败", f"自动抓取失败:\n{msg}")
         self._log(f"发现失败: {msg}")
     
@@ -220,3 +267,15 @@ class QuickScanWizard(QWizard):
         self.addPage(_IntroPage())
         self.addPage(_TargetPage())
         self.addPage(_DonePage())
+
+    def done(self, result):
+        """向导结束（完成/取消/关闭）时回收各页面的发现线程，防止页面析构时线程仍在运行。"""
+        for page_id in self.pageIds():
+            page = self.page(page_id)
+            detach = getattr(page, "_detach_worker", None)
+            if callable(detach):
+                try:
+                    detach()
+                except Exception:
+                    pass
+        super().done(result)

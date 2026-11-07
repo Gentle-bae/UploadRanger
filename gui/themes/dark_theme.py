@@ -443,3 +443,79 @@ def apply_dark_theme(app: QApplication):
     palette.setColor(QPalette.HighlightedText, QColor('white'))
     
     app.setPalette(palette)
+
+
+def enable_dark_title_bar(widget) -> bool:
+    """Windows 下把窗口标题栏切为深色（浅色系统下深色窗口配白标题栏割裂）。
+
+    Win10 1809+: DWMWA_USE_IMMERSIVE_DARK_MODE(20/19)；Win11 额外把标题栏
+    底色/文字色画成主题色。全部静默失败，非 Windows 无操作。
+    【注】不加 BORDER_COLOR 描边——保持 v1.2.0 原版观感（用户明确要求一致）。
+    
+
+/* === 【补齐】多行编辑器(QPlainTextEdit 与 QTextEdit 观感一致) === */
+QTextEdit, QPlainTextEdit {
+    background-color: #252536;
+    color: #f1f1f4;
+    border: 1px solid #3d3d5c;
+    border-radius: 4px;
+    padding: 4px;
+    selection-background-color: #7c3aed;
+    selection-color: white;
+}
+
+QTextEdit:focus, QPlainTextEdit:focus {
+    border: 1px solid #7c3aed;
+}
+
+/* === 【补齐】数字输入框 === */
+QSpinBox, QDoubleSpinBox {
+    background-color: #252536;
+    color: #f1f1f4;
+    border: 1px solid #3d3d5c;
+    border-radius: 4px;
+    padding: 4px 6px;
+}
+
+QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid #7c3aed;
+}
+
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    background-color: #2d2d44;
+    border: none;
+    width: 16px;
+}
+
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #7c3aed;
+}
+
+/* === 【补齐】对话框族 === */
+QDialog, QMessageBox {
+    background-color: #1e1e2e;
+    color: #f1f1f4;
+}
+
+QMessageBox QLabel {
+    background-color: transparent;
+    color: #f1f1f4;
+}
+
+"""
+    import sys
+    if not sys.platform.startswith('win'):
+        return False
+    try:
+        import ctypes
+        hwnd = int(widget.winId())
+        dwm = ctypes.windll.dwmapi
+        value_true = ctypes.c_int(1)
+        for attr in (20, 19):
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value_true), 4) == 0:
+                return True
+        return False
+    except Exception:
+        return False

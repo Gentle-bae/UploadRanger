@@ -1,8 +1,68 @@
 # UploadRanger 更新日志
 
-## v1.2.0（计划发布：2026-08-16）- 强可信度版
+## v1.3.0（2026-11-07）- 代理链与可信证据版
 
-> v1.2.0 为待发布版本。以下内容按 v1.1.1（tag `a96f4fd`）到当前代码的实际差异整理。
+> 基于 2026-11-05 全量代码审计的 60+ 项发现整体整改。
+
+### 🎯 真实靶场实战修复（2026-11-07）
+
+- **证书源统一**：httpx 改用系统证书库（与 raw socket 一致），修复"证书链不完整靶场上传成功但验证 GET 全部 SSL 失败"的分裂行为。
+- **失败可见化 + 熔断**：上传异常不再静默吞掉（此前"扫描完成 0 结果"强误导）；连续 5 次网络失败自动中止扫描并提示原因。
+- **TLS 证书校验开关**：扫描页新增「忽略TLS证书校验(自签名靶场)」（默认仍校验，安全声明不变）；MCP `uploadranger_scan` 新增 `verify_ssl` 参数。
+- **JS 渲染上传组件接口推断**：layui `upload.render({url:...})` / 对象式 `url:` 写在页面 script 里的上传接口，此前完全探测不到（全部 payload 打到错误端点）；现无经典表单时自动从 JS 推测候选（仅同源过门禁）。实测成功推断 `/upload/`。
+- **结构注入型图片马 payload**：新增 `polyglot_png_struct` / `polyglot_jpg_struct`（PIL 随机底图 + PolyglotBuilder 真实底图注入 + nonce 探针嵌底）。在线实测：服务端内容校验（getimagesize 类）下，简化"签名+文本"payload 全部被拒，结构注入型上传成功且 PHP 真实执行——与 `verified_execution` 判定闭环。
+- **续扫顺序签名**：断点续扫记录 payload 顺序签名，指纹变化导致顺序不同时自动回退从头扫描，杜绝索引错位跳扫。
+- 已知待办：页面 JS 字面量与真实后端脱节时（layui 写 `/upload/` 但实际 `/upload.php`），静态推断无法覆盖，待补端点变体探测。
+
+### 🛡️ 高危修复
+
+- **修复 Polyglot 生成器全量失效**（双反斜杠转义事故）：GIF/PNG/JPG 三类结构型图片马此前产物为垃圾字节，现全部通过「正确魔术字节 + PIL 可打开」双重实测；`create_gif_php` 补齐图像描述符与 LZW 数据段，PNG `raw_data` 修正为 1x1 灰度真实字节数，JPG COM 段补 0xFF 消毒与 DHT 长度对齐；`create_micro_gif_php` 修复 >255 字节代码崩溃（子块分块）。`test_all.py` 增加真实有效性断言（魔术字节 + PIL verify + 抽象约束 + LF 模板产出），杜绝同类事故静默复发。
+- **执行证据链 nonce 化**：删除全仓库无生成端的 `UploadForge_Test_Success_` 标记与可被静态回显满足的 "46" 弱匹配。安全模式为每次扫描生成唯一 nonce，新增无害执行探针 payload（PHP/JSP/ASP.NET 仅回显标识），RCE 判定要求「响应回显本轮 nonce 且响应字节 ≠ 原文件」——误报通道封死，原不可达的 RCE 判定恢复可用。
+- **MCP 服务端加固**：`uploadranger_scan` 接入私网/回环门禁；raw_request 的 Host 头与声明目标双层一致性校验（堵目标改写）；verify 重定向改为手动逐跳并每跳过门禁（≤5 跳）；SSE/streamable-http 非回环绑定默认拒绝启动（需 `--danger-allow-remote`），支持 `UPLOADRANGER_MCP_TOKEN` Bearer 鉴权（常数时间比对，已实测 401/200）；任务表 FIFO 上限 200、单任务日志上限 500、并发信号量 5；日志迁至 `~/.uploadranger/mcp.log`（POSIX 0600），GUI 面板同步跟随。
+- **代理输入不再静默直连**：扫描页代理输入统一经 `ProxyConfig.parse` 归一化（无 scheme 自动补 `http://`），非法格式红字报错而非裸发——此前用户以为在走 Burp 抓包实际全直连。
+
+### 🌐 Issue #8：上游代理转发（Burp upstream proxy 等价功能）
+
+- 新增 `core/proxy_config.py` 统一代理配置源：支持 http / https / socks5 / socks5h / socks4、用户名密码、no_proxy 直连例外、连通性测试（延迟 + 出口 IP）。
+- **RawHTTPClient 支持 SOCKS5**：RFC1928 握手 + RFC1929 认证，CONNECT 使用 ATYP=domain（域名由代理解析，内网渗透必需）；HTTP(S) 代理补 `Proxy-Authorization: Basic` 认证（此前带认证的代理完全不可用）；删除死代码 `_build_proxy_request`/`_parse_proxy`。
+- 三个扫描客户端（httpx / requests / raw socket）统一接线上游代理；requirements 增加 `httpx[socks]`、`requests[socks]`。
+- **内置抓包代理支持上游链**：ProxyThread 新增 upstream 参数，`opts.mode = ["upstream:..."]` 实现「浏览器 → UploadRanger 抓包 → 上游 HTTP 代理 → 内网」；代理页新增「上游代理」配置组与「测试连通」按钮，配置持久化到用户目录。
+- Repeater / Intruder 发送请求自动走全局上游代理配置（有配置走代理，无配置直连）。
+- MCP `--proxy` 参数：六个工具的出网流量可统一走上游代理。
+
+### 🧠 智能扫描
+
+- **请求按 payload 类型自动变化**：此前除 MIME 伪造外所有上传请求的文件 Content-Type 均为 `application/octet-stream`；现按扩展名自动匹配真实 MIME（图片/文档/HTML/SVG 等 18 类），multipart boundary 每请求在三种风格间轮换——服务端 MIME/结构校验类绕过的测试结果更真实。
+- **智能后缀优选**：扫描页新增「智能优选（按指纹自动调整后缀优先级）」开关（默认开启），指纹识别出服务器语言后自动将匹配语言族的 payload 前置，指纹不可用时保持原顺序。
+
+### 🔒 网络与扫描器健壮性
+
+- `url_guard`：非法端口 fail-closed、数值 IP 编码（0x7f000001 等）解析失败视为拦截、DNS 解析加 60s TTL 缓存（缩小 rebinding TOCTOU 窗口）。
+- RawHTTPClient：Set-Cookie 统一按行分隔（修 Expires 日期被逗号切碎）；响应体读取上限提为可配置参数（15s / 4MB）并带 `truncated` 标注；gzip/deflate 解压失败回退 raw deflate，双失败保留原字节并明确标注。
+- 异步客户端流量日志加 32KB 截断保护（原 latin-1 永不失败导致设计中的截断分支不可达、任意大响应全量入日志）。
+- `http_client` 上传异常路径 headers 污染修复（try/finally）；`urllib3.disable_warnings` 从模块导入期移到按需调用。
+- 扫描主循环清理逻辑移入 finally（取消扫描不再泄漏 AsyncClient/连接）；裸 `except:` 改为不吞 CancelledError；渗透模式日志中的 WebShell 密码脱敏（首字符+***）。
+
+### 🖥️ GUI 稳定性与性能
+
+- 修复「发送到扫描器」可双启动扫描 worker（结果表互相污染 + UI 提前恢复）。
+- 修复关闭 Intruder 标签丢弃运行中 QThread 的段错误风险（运行中 worker 移交容器，finished 回调统一清理）；Intruder 补 `tabMoved` 同步（拖动标签后不再切错/关错）；停止攻击先断开全部信号（旧 worker 在途结果不再污染新一轮）。
+- closeEvent 全部改协作式停止（删除所有 `terminate()` 强杀）；「重置界面」先停旧代理/MCP 再销毁页面（原来整套页面树泄漏且旧代理线程不停止）；删除 `_on_progress` 中的 `processEvents()` 重入。
+- 大响应不再冻结界面：chardet 只采样前 64KB、删除两处冗余全量 `rehighlight()`、Hex 视图上限 64KB 并标注总大小。
+- Render 视图默认禁用 JS、默认以 about:blank 渲染（渲染不可信响应的安全边界），新增显式开关；删除重复定义的 `_build_render_info_page`；修复「清空后旧渲染内容复活」。
+- 流量历史 / 代理历史 / 拦截列表加 5000 条容量上限（超限淘汰最旧，内存有界）。
+- 代理子系统修复：拦截放行后响应正确关联原记录（不再产生重复条目）、`waiting_flows` 不再无限增长、30 秒拦截超时通知 GUI 移除行、拦截编辑器升级为完整请求重建（method/路径/headers/body 全部可编辑生效）、修复历史/拦截面板「复制选中行」NameError（缺 QApplication 导入）、跨线程 `asyncio.Event.set()` 改 `call_soon_threadsafe`、代理线程不再篡改全局 root logger、`ssl_insecure` 提为可配置。
+- Intruder 每次攻击共享单个 httpx.AsyncClient（连接复用，此前每 payload 重建 TCP/TLS 握手）；Sniper 模式非目标位置保留原始值（与 Burp 语义一致）；修复 https 目标被 Intruder 以 http 打出、攻击结束恢复排序。
+- Intruder payload 策略：CRLF 正则改 `\r?\n` 并在入口统一行尾归一（GUI 文本框 LF 模板此前静默产出 0 条）；策略异常记日志不再静默；修复 Python 2 式 `__metaclass__`（抽象约束在 Py3 失效）；便捷函数不再孤儿化共享 FuzzConfig 单例。
+- 配置管理器：加载与默认值深合并（手工编辑缺键不再返回 None）、`config` property 深拷贝（防嵌套值写穿）、配置文件权限收紧（POSIX 0600）。
+- 向导「发现上传点」worker 生命周期修复（分析中关闭向导不再崩溃），信号名避开 QThread 内建 `finished`。
+
+### 📌 版本与合规说明
+
+- 遵循发布纪律：GitHub 最新发布为 v1.2.0，本版本统一为 **v1.3.0**，发布前不再拆分迭代版本号。
+- 定位保持「文件上传测试与验证」工具：不添加后渗透能力；渗透模式合并为扫描前单一确认对话框（模式说明 + 目标 + 可执行后缀 + 风险提示），替代逐项弹窗。
+
+## v1.2.0（2026-08-16 发布）- 强可信度版
 
 ### ✅ 已完成修复与改进
   - 同步扫描器代理参数与 httpx 0.28 兼容性已修复。

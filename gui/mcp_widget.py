@@ -12,7 +12,8 @@ from PySide6.QtCore import QProcess, Qt, QTimer, QSettings
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox, QPlainTextEdit, QGroupBox, QComboBox, QSpinBox
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MCP_LOG_FILE = PROJECT_ROOT / ".uploadranger_mcp.log"
+# 【同步 core/mcp/server.py C6】MCP 日志已迁至用户配置目录，此处跟随以继续轮询外部进程日志
+MCP_LOG_FILE = Path.home() / ".uploadranger" / "mcp.log"
 MCP_PID_FILE = PROJECT_ROOT / ".uploadranger_mcp.pid"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 

@@ -15,22 +15,24 @@ Intruder Payload Generator - 文件上传漏洞Payload生成引擎
 覆盖的绕过技术: 14+ 种核心策略 + 新增的高级绕过
 
 Author: Integrated from Upload_Auto_Fuzz.py
-Version: 1.2.0
+Version: 1.3.0
 License: MIT
 """
 
+import logging
 import re
-import base64
 import hashlib
 from abc import ABCMeta, abstractmethod
-from typing import List, Dict, Generator, Optional, Set
+from typing import List, Dict, Optional, Set
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
 # Constants and Configuration
 # =============================================================================
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 MAX_PAYLOADS_DEFAULT = 2000
 MAX_FILENAME_LENGTH = 255
 
@@ -261,6 +263,20 @@ class FuzzConfig:
     def reset(cls):
         """Reset the singleton instance (useful for testing)."""
         cls._instance = None
+
+    @classmethod
+    def detached(cls) -> "FuzzConfig":
+        """创建脱离单例的独立实例（便捷函数用）。
+
+        便捷函数若直接改共享单例（set_target_languages/max_payloads），
+        会把调用方临时参数固化成全局默认（二轮审计 P2 回归）；若用
+        force_new 则孤儿化已配置的全局配置（原缺陷）。detached() 两个都不沾：
+        返回全新独立实例，共享单例完全不受影响。
+        """
+        new = object.__new__(cls)
+        new._initialized = False  # 手工构造绕过 __new__ 的单例分支，需自行置位
+        new.__init__()
+        return new
     
     def set_target_languages(self, languages: List[str]):
         """Set target backend languages."""
@@ -282,7 +298,7 @@ class FuzzConfig:
 # Abstract Base Strategy
 # =============================================================================
 
-class FuzzStrategy:
+class FuzzStrategy(metaclass=ABCMeta):
     """
     Abstract base class for all fuzzing strategies.
     
@@ -290,8 +306,6 @@ class FuzzStrategy:
     payloads accordingly. Strategies are designed to be composable and
     independently testable.
     """
-    
-    __metaclass__ = ABCMeta
     
     # Strategy metadata
     name = "base"
@@ -693,7 +707,7 @@ class MagicBytesStrategy(FuzzStrategy):
         
         base_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
         
-        content_match = safe_regex_search(r'Content-Type:[^\r\n]*\r\n\r\n', template)
+        content_match = safe_regex_search(r'Content-Type:[^\r\n]*\r?\n\r?\n', template)
         if not content_match:
             return
         
@@ -803,8 +817,8 @@ class WebShellContentStrategy(FuzzStrategy):
         base_name = filename.rsplit('.', 1)[0] if '.' in filename else filename
         
         content_match = safe_regex_search(
-            r'(Content-Type:[^\r\n]*\r\n\r\n)(.*?)(?:\r\n--|\Z)', 
-            template, 
+            r'(Content-Type:[^\r\n]*\r?\n\r?\n)(.*?)(?:\r?\n--|\Z)',
+            template,
         )
         
         if not content_match:
@@ -961,6 +975,10 @@ class PayloadFactory:
         Returns:
             List of unique payload strings
         """
+        # 统一行尾为 CRLF：GUI 文本框(toPlainText)与跨平台编辑器常产生 LF，
+        # 策略正则按 HTTP 规范匹配 CRLF，不归一会导致 LF 模板静默产出 0 条。
+        template = template.replace("\r\n", "\n").replace("\n", "\r\n")
+
         # Parse template
         filename, extension, _ = extract_filename_parts(template)
         content_type = extract_content_type(template)
@@ -994,6 +1012,8 @@ class PayloadFactory:
                         return payloads
                         
             except Exception as e:
+                # 策略崩溃不能静默吞掉：否则 payload 数量无声缩水，排查困难
+                logger.warning("策略 %s 生成失败: %s", name, e)
                 continue
         
         return payloads
@@ -1016,11 +1036,11 @@ def generate_intruder_payloads(template: str, languages: List[str] = None,
     Returns:
         List of payload strings
     """
-    config = FuzzConfig(force_new=True)
+    config = FuzzConfig.detached()  # 独立实例：既不污染共享单例，也不孤儿化它
     if languages:
         config.set_target_languages(languages)
     config.max_payloads = max_payloads
-    
+
     factory = PayloadFactory(config)
     return factory.generate_payloads(template)
 
@@ -1032,7 +1052,7 @@ def get_payload_statistics() -> Dict:
     Returns:
         Dictionary with payload statistics
     """
-    config = FuzzConfig(force_new=True)
+    config = FuzzConfig.detached()  # 只读统计,同样用独立实例避免任何副作用
     factory = PayloadFactory(config)
     
     return {

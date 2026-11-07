@@ -10,9 +10,6 @@ from urllib.parse import urljoin, urlparse
 import time
 import random
 
-# 禁用SSL警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 class HTTPClient:
     """HTTP客户端类"""
@@ -39,6 +36,12 @@ class HTTPClient:
                 "http": proxy,
                 "https": proxy
             }
+
+        # 【修复】告警屏蔽从模块导入期移到实例构造内，且仅在用户显式关闭
+        # TLS 校验时执行——避免 import 本模块就污染整个进程的告警可见性，
+        # 其他保持 verify=True 的代码路径的证书错误不再被静音。
+        if not self.verify_ssl:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     def set_header(self, key, value):
         """设置请求头"""
@@ -123,64 +126,67 @@ class HTTPClient:
                 field_name: (filename, file_content, content_type or 'application/octet-stream')
             }
             
-            # 临时修改headers
+            # 临时修改headers（【修复】包进 try/finally，异常路径也恢复原始
+            # headers，避免 session 被 Content-Type 删除/自定义头残留污染）
             original_headers = self.session.headers.copy()
-            if headers:
-                for key, value in headers.items():
-                    self.session.headers[key] = value
-            
-            # 移除Content-Type让requests自动设置
-            if 'Content-Type' in self.session.headers:
-                del self.session.headers['Content-Type']
-            
-            response = self.session.post(
-                url,
-                files=files,
-                data=data or {},
-                timeout=self.timeout,
-                verify=self.verify_ssl
-            )
-            
-            # 恢复原始headers
-            self.session.headers = original_headers
-            
+            try:
+                if headers:
+                    for key, value in headers.items():
+                        self.session.headers[key] = value
+
+                # 移除Content-Type让requests自动设置
+                if 'Content-Type' in self.session.headers:
+                    del self.session.headers['Content-Type']
+
+                response = self.session.post(
+                    url,
+                    files=files,
+                    data=data or {},
+                    timeout=self.timeout,
+                    verify=self.verify_ssl
+                )
+            finally:
+                # 恢复原始headers
+                self.session.headers = original_headers
+
             return response
-            
+
         except Exception as e:
             return {"error": str(e)}
-    
-    def upload_bytes(self, url, field_name, file_bytes, filename, 
+
+    def upload_bytes(self, url, field_name, file_bytes, filename,
                      data=None, headers=None, content_type=None):
         """上传字节数据"""
         try:
             if self.delay > 0:
                 time.sleep(self.delay + random.uniform(0, 0.5))
-            
+
             files = {
                 field_name: (filename, file_bytes, content_type or 'application/octet-stream')
             }
-            
-            # 临时修改headers
+
+            # 临时修改headers（【修复】包进 try/finally，异常路径也恢复原始headers）
             original_headers = self.session.headers.copy()
-            if headers:
-                for key, value in headers.items():
-                    self.session.headers[key] = value
-            
-            if 'Content-Type' in self.session.headers:
-                del self.session.headers['Content-Type']
-            
-            response = self.session.post(
-                url,
-                files=files,
-                data=data or {},
-                timeout=self.timeout,
-                verify=self.verify_ssl
-            )
-            
-            self.session.headers = original_headers
-            
+            try:
+                if headers:
+                    for key, value in headers.items():
+                        self.session.headers[key] = value
+
+                if 'Content-Type' in self.session.headers:
+                    del self.session.headers['Content-Type']
+
+                response = self.session.post(
+                    url,
+                    files=files,
+                    data=data or {},
+                    timeout=self.timeout,
+                    verify=self.verify_ssl
+                )
+            finally:
+                self.session.headers = original_headers
+
             return response
-            
+
         except Exception as e:
             return {"error": str(e)}
     

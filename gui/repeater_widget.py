@@ -24,6 +24,22 @@ from .response_viewer import ResponseViewerWidget
 
 logger = logging.getLogger(__name__)
 
+
+def global_proxy_mounts():
+    """读取全局上游代理配置（core.proxy_config 唯一配置源，Issue #8）。
+
+    有持久化的上游配置则返回 httpx mounts；没有配置返回 None（直连）。
+    Repeater/Intruder 不加 UI 控件，统一读全局配置。
+    """
+    try:
+        from core.proxy_config import ProxyConfig
+        pc = ProxyConfig.load_saved()
+        if pc is not None:
+            return pc.for_httpx()
+    except Exception:
+        pass
+    return None
+
 # Import payload generators
 try:
     from ..payloads.intruder_payloads import generate_intruder_payloads, PayloadFactory, FuzzConfig
@@ -107,7 +123,9 @@ class RepeaterWorker(QThread):
         # Default Burp-like behavior: do NOT auto-follow redirects.
         # When enabled, this may turn a single POST into POST+GET and the final page may include
         # accumulated session flash messages.
-        async with httpx.AsyncClient(verify=True, timeout=30, follow_redirects=follow_redirects) as client:
+        # 【修复】发送走全局上游代理（Issue #8）：有持久化的 ProxyConfig 就挂 mounts，没有则直连
+        async with httpx.AsyncClient(verify=True, timeout=30, follow_redirects=follow_redirects,
+                                     mounts=global_proxy_mounts()) as client:
             request_kwargs = {'headers': headers}
             if body:
                 request_kwargs['content'] = body.encode('utf-8') if isinstance(body, str) else body
@@ -171,9 +189,11 @@ class RepeaterTab(QWidget):
 
     def stop_worker(self) -> None:
         """安全停止 worker，避免标签关闭后仍触发回调导致崩溃。
-        
+
         简单原则：断开所有指向本 tab 的信号连接，让 worker 自行结束。
         不要阻塞 wait()，不要强制 delete，避免 Qt 崩溃。
+        【修复 P2】断开信号后 worker 引用移交容器持有至线程自然退出，
+        不再直接置 None——引用清零会在 QThread 仍在 run() 时触发析构崩溃。
         """
         self._closing = True
         w = getattr(self, "worker", None)
@@ -190,7 +210,19 @@ class RepeaterTab(QWidget):
             pass
         # 请求停止（线程安全）
         w.stop()
-        # 不要 wait()，不要 deleteLater()，让 worker 自行退出和 GC
+        # 引用移交容器：finished/退出后由容器统一 discard，运行中不丢引用
+        container = getattr(self, "_host_container", None)
+        if container is not None and hasattr(container, "_running_workers"):
+            try:
+                container._running_workers.add(w)
+                w.finished.connect(
+                    lambda wk=w: (container._running_workers.discard(wk), wk.deleteLater())
+                )
+            except Exception:
+                pass
+        else:
+            # 无容器（独立使用）时保持引用至线程结束，防 GC 析构运行中线程
+            self._detached_worker = w
         self.worker = None
 
     def _build_ui(self):
@@ -802,6 +834,8 @@ class RepeaterWidget(QWidget):
         self._tab_counter = 1
         # 【修复】保存已关闭的 widget 引用，避免立即 deleteLater 导致崩溃
         self._closed_tabs = []
+        # 【修复 P2】运行中 worker 容器：标签关闭后引用移交至此，线程退出后清理
+        self._running_workers = set()
         self._init_ui()
     
     def _init_ui(self):
@@ -859,13 +893,14 @@ class RepeaterWidget(QWidget):
         if name is None:
             name = f"Repeater {self._tab_counter}"
         self._tab_counter += 1
-        
+
         tab = RepeaterTab(name)
+        tab._host_container = self  # 【修复 P2】stop_worker 时 worker 引用移交容器
         tab.send_to_scanner.connect(self.send_to_scanner.emit)
         tab.request_sent.connect(self._on_request_sent)
         self.content_stack.addWidget(tab)
         tab_index = self.tab_bar.addTab(name)
-        
+
         self.tab_bar.setCurrentIndex(tab_index)
         return tab_index, tab
 

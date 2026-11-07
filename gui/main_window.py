@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-主窗口 - UploadRanger GUI主界面 v1.2.0
+主窗口 - UploadRanger GUI主界面 v1.3.0
 整合upload_forge功能，添加请求/响应查看、Repeater和Intruder功能
 """
 
@@ -17,7 +17,7 @@ from urllib.error import URLError, HTTPError
 from threading import Thread
 
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QTabWidget, QFormLayout,
     QTextEdit, QProgressBar, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QCheckBox, QSpinBox, QSplitter,
@@ -45,6 +45,14 @@ from .mcp_widget import MCPPanel
 # 【新增】成功状态背景色常量
 SUCCESS_BG_COLOR = "#1a3d1a"  # 深绿色背景
 VULN_BG_COLOR = "#3d1a3d"    # 深紫色背景（漏洞）
+
+
+def _mask_secret(value: str) -> str:
+    """敏感凭据脱敏：仅保留首字符，其余以 *** 代替（日志常被截图分享）。"""
+    value = str(value or "")
+    if not value:
+        return "***"
+    return value[0] + "***"
 
 # 导入核心模块
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -835,10 +843,12 @@ class MainWindow(QMainWindow):
         
         # 初始化组件
         self.worker = None
+        self._scan_proxy_config = None  # 本次扫描使用的上游代理（ProxyConfig），供日志/复核
         self._scan_stop_requested = False
         self._scan_progress_current = 0
         self._scan_progress_total = 0
         self._scan_resume_index = 0
+        self._scan_resume_order_sig = ""  # 续扫顺序签名（防指纹变化导致索引错位）
         self._resume_requested = False
         self.shell_generator = WebShellGenerator()
         self.bypass_generator = BypassPayloadGenerator()
@@ -853,9 +863,17 @@ class MainWindow(QMainWindow):
         # 【新增】Diff对比功能 - 基准响应存储
         self.baseline_response = None
         
-        # 创建UI
+        # 【修复】主题应用移入实例化:此前只在 run_gui() 调用 apply_dark_theme,
+        # 任何绕过 run_gui 的实例化(测试/嵌入/二次实例化)都是无主题灰色界面,
+        # 造成"我启动是灰色、用户 bat 启动是紫色"的分裂假象。setStyleSheet 幂等。
+        apply_dark_theme(QApplication.instance())
         self._create_ui()
+        # 深色标题栏只应用一次的标记(showEvent 里使用)
+        self._dark_titlebar_applied = False
 
+        # 【修复 P2】一次性资源只建一次：此前放在 showEvent 里，每次显示窗口
+        # （最小化恢复/切虚拟桌面都会触发）都会新建 bridge/定时器并重复赋值
+        # closeEvent，parent=self 的对象常驻累积。
         self._update_bridge = _UpdateCheckBridge(self)
         self._update_bridge.succeeded.connect(self._on_update_check_succeeded)
         self._update_bridge.failed.connect(self._on_update_check_failed)
@@ -867,18 +885,42 @@ class MainWindow(QMainWindow):
         self._discover_bridge.succeeded.connect(self._on_discover_uploads_succeeded)
         self._discover_bridge.failed.connect(self._on_discover_uploads_failed)
 
-        # 【修复】连接关闭事件
+        # 关闭事件走统一入口（原为实例属性赋值，改在 __init__ 一次性绑定）
         self.closeEvent = self._on_close_event
+
+    def showEvent(self, event):
+        """窗口显示后把系统标题栏切为深色(浅色系统下白标题栏与深色界面割裂,grab 截图不可见)"""
+        super().showEvent(event)
+        if not self._dark_titlebar_applied:
+            try:
+                from .themes.dark_theme import enable_dark_title_bar
+                if enable_dark_title_bar(self):
+                    self._dark_titlebar_applied = True
+            except Exception:
+                pass
     
     def _load_icon(self):
-        """加载应用图标"""
-        assets_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
-        # Windows 任务栏优先使用 ICO；开发环境没有 ICO 时回退 PNG。
-        for filename in ("icon.ico", "icon.png"):
-            icon_path = os.path.join(assets_dir, filename)
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-                break
+        """加载应用图标（源码目录 / PyInstaller _internal / exe 同级三路回退）"""
+        candidates = []
+        # 1) 源码树: 项目根/assets
+        candidates.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets"))
+        # 2) PyInstaller 打包: 模块位于 _internal 下,资源同样收集到 _internal/assets
+        if getattr(sys, "frozen", False):
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(os.path.join(meipass, "assets"))
+            candidates.append(os.path.join(os.path.dirname(sys.executable), "assets"))
+        # 3) exe 同级目录(build_exe.py 保留的同级资源副本)
+        candidates.append(os.path.join(os.getcwd(), "assets"))
+        for assets_dir in candidates:
+            for filename in ("icon.ico", "icon.png"):
+                icon_path = os.path.join(assets_dir, filename)
+                if os.path.exists(icon_path):
+                    icon = QIcon(icon_path)
+                    if not icon.isNull():
+                        self.setWindowIcon(icon)
+                        QApplication.instance().setWindowIcon(icon)  # 全局兜底(对话框等)
+                        return
 
     def _on_close_event(self, event):
         """窗口关闭前停止所有后台线程 - 修复卡顿问题"""
@@ -892,17 +934,14 @@ class MainWindow(QMainWindow):
         self._log("正在关闭应用程序，停止所有后台线程...")
         
         try:
-            # 1. 停止扫描worker线程 - 【修复】强制终止事件循环
+            # 1. 停止扫描worker线程 - 【修复】协作式停止，绝不 terminate：
+            #    terminate 会绕过 finally 块，asyncio 事件循环不关闭、RawHTTPClient socket 泄露
             if hasattr(self, 'worker') and self.worker:
                 if self.worker.isRunning():
                     self._log("正在停止扫描worker线程...")
                     self.worker.stop()
-                    # 【修复】缩短等待时间，避免卡顿
-                    if not self.worker.wait(1000):
-                        self._log("警告: Worker线程停止超时，强制终止...")
-                        # 【关键修复】强制终止线程
-                        self.worker.terminate()
-                        self.worker.wait(500)
+                    if not self.worker.wait(5000):
+                        self._log("停止超时,可能有在途请求")
                     self.worker = None
             
             # 2. 停止代理线程
@@ -913,7 +952,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             
-            # 3. 停止Repeater和Intruder中的worker - 【修复】强制终止
+            # 3. 停止Repeater和Intruder中的worker - 【修复】一律协作式停止
             if hasattr(self, 'mcp_panel') and self.mcp_panel:
                 self.mcp_panel.shutdown()
 
@@ -921,10 +960,11 @@ class MainWindow(QMainWindow):
                 if hasattr(self, 'repeater') and self.repeater:
                     for i in range(self.repeater.content_stack.count()):
                         tab = self.repeater.content_stack.widget(i)
-                        if hasattr(tab, 'worker') and tab.worker:
-                            if tab.worker.isRunning():
-                                tab.worker.terminate()
-                                tab.worker.wait(300)
+                        worker = getattr(tab, 'worker', None)
+                        if worker:
+                            worker.stop()
+                            if not worker.wait(5000):
+                                self._log("停止超时,可能有在途请求")
             except Exception:
                 pass
             
@@ -932,10 +972,19 @@ class MainWindow(QMainWindow):
                 if hasattr(self, 'intruder') and self.intruder:
                     for i in range(self.intruder.content_stack.count()):
                         tab = self.intruder.content_stack.widget(i)
-                        if hasattr(tab, 'worker') and tab.worker:
-                            if tab.worker.isRunning():
-                                tab.worker.terminate()
-                                tab.worker.wait(300)
+                        worker = getattr(tab, 'worker', None)
+                        if worker:
+                            worker.stop()
+                            if not worker.wait(5000):
+                                self._log("停止超时,可能有在途请求")
+                    # 关标签时移交到容器的运行中 worker 也要一并停止
+                    for worker in list(getattr(self.intruder, '_running_workers', ())):
+                        try:
+                            worker.stop()
+                            if not worker.wait(5000):
+                                self._log("停止超时,可能有在途请求")
+                        except Exception:
+                            pass
             except Exception:
                 pass
             
@@ -1076,18 +1125,52 @@ class MainWindow(QMainWindow):
                 self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {reset_msg}")
             
             current_index = self.tabs.currentIndex()
+
+            # 【修复】重置前先停扫描 worker：否则旧 worker 成孤儿继续发
+            # result/traffic 信号，把旧扫描数据灌进重建后的全新表格
+            old_worker = getattr(self, 'worker', None)
+            if old_worker is not None:
+                try:
+                    old_worker.stop()
+                    if not old_worker.wait(3000):
+                        self._log("警告: 重置界面时扫描线程停止超时，可能有在途请求")
+                except Exception:
+                    pass
+                self.worker = None
+                self._scan_finished_handled = False
+                self.start_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+
+            # 【修复】先停止旧组件的后台资源：旧代理线程（mitmproxy）若仍在监听会误导用户，
+            # 旧 MCP 面板持有的 QProcess 也要一并回收
+            old_proxy = getattr(self, 'proxy_widget', None)
+            if old_proxy is not None:
+                try:
+                    old_proxy.stop_proxy()
+                except Exception:
+                    pass
+            old_mcp = getattr(self, 'mcp_panel', None)
+            if old_mcp is not None:
+                for method_name in ('shutdown', 'stop_server', 'stop'):
+                    stop_fn = getattr(old_mcp, method_name, None)
+                    if callable(stop_fn):
+                        try:
+                            stop_fn()
+                        except Exception:
+                            pass
+                        break
             
-            # 记录当前各个标签页的状态
-            tab_states = {}
-            for i in range(self.tabs.count()):
-                tab_text = self.tabs.tabText(i)
-                tab_widget = self.tabs.widget(i)
-                if tab_widget:
-                    tab_states[tab_text] = tab_widget
-            
-            # 清除所有标签页
+            # 清除所有标签页（removeTab 只摘标签，必须 deleteLater 释放整套页面树）
+            old_widgets = [self.tabs.widget(i) for i in range(self.tabs.count())]
             while self.tabs.count() > 0:
                 self.tabs.removeTab(0)
+            for old_widget in old_widgets:
+                if old_widget is None:
+                    continue
+                try:
+                    old_widget.deleteLater()
+                except Exception:
+                    pass
             
             # 重新创建所有标签页
             self._create_scan_tab()
@@ -1358,7 +1441,7 @@ class MainWindow(QMainWindow):
         if is_penetration:
             self._log("[渗透测试模式] 将上传WebShell等攻击载荷")
             config = self._webshell_config
-            self._log(f"  - WebShell密码: {config['password']}")
+            self._log(f"  - WebShell密码: {_mask_secret(config['password'])}")
             self._log(f"  - Shell类型: {config['type']}")
         else:
             self._log("[安全测试模式] 将上传无害内容，仅证明漏洞存在")
@@ -1372,7 +1455,7 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec():
             self._webshell_config = dialog.get_config()
-            self._log(f"[Shell设置] 密码: {self._webshell_config['password']}, 类型: {self._webshell_config['type']}")
+            self._log(f"[Shell设置] 密码: {_mask_secret(self._webshell_config['password'])}, 类型: {self._webshell_config['type']}")
     
     def _get_scan_mode(self):
         """获取当前扫描模式"""
@@ -1562,8 +1645,8 @@ class MainWindow(QMainWindow):
         self.use_proxy_cb.setToolTip("使用HTTP代理")
         proxy_row.addWidget(self.use_proxy_cb)
         self.proxy_input = QLineEdit()
-        self.proxy_input.setPlaceholderText("127.0.0.1:8080")
-        self.proxy_input.setFixedWidth(150)
+        self.proxy_input.setPlaceholderText("http://127.0.0.1:8080 或 socks5://user:pass@ip:1080")
+        self.proxy_input.setFixedWidth(230)
         proxy_row.addWidget(self.proxy_input)
         proxy_row.addStretch()
         left_layout.addLayout(proxy_row)
@@ -1679,6 +1762,30 @@ class MainWindow(QMainWindow):
         options_row.addWidget(self.ext_count_label)
         options_layout.addLayout(options_row)
         
+        # 智能优选开关：开启后按环境指纹把匹配语言的 payload 前置
+        smart_row = QHBoxLayout()
+        self.smart_ext_cb = QCheckBox("智能优选(按指纹自动调整后缀优先级)")
+        self.smart_ext_cb.setChecked(True)
+        self.smart_ext_cb.setToolTip(
+            "开启后按环境指纹把匹配语言的 payload 前置，指纹不可用时保持原顺序"
+        )
+        smart_row.addWidget(self.smart_ext_cb)
+        smart_row.addStretch()
+        options_layout.addLayout(smart_row)
+
+        # 【新增】TLS 证书校验开关：默认开启校验（README 安全声明），自签名/
+        # 证书链不完整的靶场可显式关闭，避免整轮扫描静默失败（二轮审计 P1）
+        tls_row = QHBoxLayout()
+        self.verify_ssl_cb = QCheckBox("忽略TLS证书校验(自签名靶场)")
+        self.verify_ssl_cb.setChecked(False)
+        self.verify_ssl_cb.setToolTip(
+            "默认校验 HTTPS 证书。目标使用自签名或证书链不完整的证书时，\n"
+            "校验会导致全部请求失败（扫描无结果），勾选后忽略校验重试。"
+        )
+        tls_row.addWidget(self.verify_ssl_cb)
+        tls_row.addStretch()
+        options_layout.addLayout(tls_row)
+        
         # 初始化后缀选择器
         self._selected_extensions = None  # None表示全选
         self._custom_payloads = []
@@ -1764,7 +1871,7 @@ class MainWindow(QMainWindow):
                 padding: 4px 8px;
             }}
             QPushButton:hover {{
-                background-color: #45a049;
+                background-color: #4CAF50;
             }}
         """)
         jump_success_btn.clicked.connect(self._jump_to_first_success)
@@ -1936,9 +2043,12 @@ class MainWindow(QMainWindow):
         self.payload_code = PayloadEditor()
         self.payload_code.setPlaceholderText("选择语言和类型后点击生成...")
         layout.addWidget(self.payload_code)
-        
+
         self._update_payload_types()
-        
+        # 【修复】进页即生成默认 payload（PHP 简单 eval + 随机密码）：
+        # 空编辑器让用户以为页面没做完；改语言/类型后点生成可刷新
+        self._generate_payload()
+
         self.tabs.addTab(payload_tab, "Payload生成器")
     
     def _create_bypass_tab(self):
@@ -2023,7 +2133,11 @@ class MainWindow(QMainWindow):
         self.bypass_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         
         layout.addWidget(self.bypass_table)
-        
+
+        # 【修复】进页即生成默认字典（shell.php）：39 种绕过技术是页面的核心内容，
+        # 空表会让用户以为页面没做完；用户改文件名/扩展名后点生成可刷新。
+        self._generate_bypass()
+
         self.tabs.addTab(bypass_tab, "绕过技术")
     
     def _create_polyglot_tab(self):
@@ -2042,13 +2156,29 @@ class MainWindow(QMainWindow):
         polyglots = self.polyglot_generator.get_all_polyglots()
         for key, info in polyglots.items():
             self.polyglot_type.addItem(info['name'], key)
+        # 【新增】结构注入型（真实底图）：separator 后追加两个自定义底图选项
+        self.polyglot_type.insertSeparator(self.polyglot_type.count())
+        self.polyglot_type.addItem("PNG结构注入(自定义底图)", "struct_png")
+        self.polyglot_type.addItem("JPEG COM注入(自定义底图)", "struct_jpg")
         
         control_layout.addWidget(self.polyglot_type)
         
         control_layout.addWidget(QLabel("PHP代码:"))
-        self.polyglot_code = QLineEdit("<?php phpinfo(); ?>")
+        # 【修复】默认代码改为无害探针：phpinfo() 作为一键默认值不合适
+        # （信息泄露型内容不该是"生成即得"），echo 探针足够验证解析与执行链路。
+        self.polyglot_code = QLineEdit("<?php echo 'UploadRanger'; ?>")
         self.polyglot_code.setMinimumWidth(300)
         control_layout.addWidget(self.polyglot_code)
+
+        # 【新增】自定义底图：选自己的图片 → 结构注入生成图片马（可过后端内容校验）
+        self._custom_image_path = ""
+        self.custom_image_btn = QPushButton("自定义底图...")
+        self.custom_image_btn.setToolTip(
+            "选择自己的 PNG/JPG 作为底图，PHP 代码注入其 tEXt/COM 结构段，\n"
+            "生成可过后端内容校验（getimagesize 类）的图片马。不选则用内置随机底图。"
+        )
+        self.custom_image_btn.clicked.connect(self._pick_custom_image)
+        control_layout.addWidget(self.custom_image_btn)
         
         control_layout.addStretch()
         
@@ -2066,15 +2196,35 @@ class MainWindow(QMainWindow):
         self.polyglot_info = QLabel("选择类型并点击生成...")
         self.polyglot_info.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 10px;")
         layout.addWidget(self.polyglot_info)
-        
-        preview_group = QGroupBox("文件预览 (十六进制)")
-        preview_layout = QVBoxLayout(preview_group)
-        
+
+        # 【新增】生成后立即显示有效性校验状态（完整图片 / 仅前缀 / 文本）
+        self.polyglot_validate = QLabel("")
+        self.polyglot_validate.setStyleSheet(f"color: {COLORS['text_secondary']}; padding: 2px 4px;")
+        layout.addWidget(self.polyglot_validate)
+
+        preview_group = QGroupBox("文件预览 (十六进制 + 图片)")
+        preview_layout = QHBoxLayout(preview_group)
+
         self.polyglot_preview = QTextEdit()
         self.polyglot_preview.setReadOnly(True)
         self.polyglot_preview.setFont(QFont("Consolas", 10))
-        preview_layout.addWidget(self.polyglot_preview)
-        
+        preview_layout.addWidget(self.polyglot_preview, 3)
+
+        # 【新增】右侧图片预览：图片马"所见即所得"
+        self.polyglot_image = QLabel()
+        self.polyglot_image.setAlignment(Qt.AlignCenter)
+        self.polyglot_image.setMinimumSize(230, 230)
+        self.polyglot_image.setText("生成后显示图片预览")
+        self.polyglot_image.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                color: {COLORS['text_secondary']};
+            }}
+        """)
+        preview_layout.addWidget(self.polyglot_image, 2)
+
         layout.addWidget(preview_group)
 
         magic_group = QGroupBox("文件签名 / Magic Bytes")
@@ -2166,42 +2316,128 @@ class MainWindow(QMainWindow):
             self._pending_logs.clear()
     
     def _create_about_tab(self):
-        """创建紧凑、可滚动的关于页，避免小窗口下内容挤压。"""
+        """创建关于页（重设计：清晰层级 + 功能矩阵 + 快速上手 + 信息栏）"""
         about_tab = QWidget()
         outer = QVBoxLayout(about_tab)
-        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.Shape.NoFrame)
-        content = QWidget(); grid = QVBoxLayout(content); grid.setContentsMargins(8, 8, 8, 8); grid.setSpacing(12)
+        content = QWidget(); page = QVBoxLayout(content); page.setContentsMargins(28, 24, 28, 24); page.setSpacing(16)
 
+        # ---- Hero：品牌 + 版本徽章 + 简介 ----
         hero = QFrame(); hero.setObjectName("aboutHero")
-        hero.setStyleSheet(f"#aboutHero {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']}; border-radius:10px; }}")
-        hero_l = QVBoxLayout(hero); hero_l.setContentsMargins(24, 20, 24, 20)
-        title = QLabel("UploadRanger"); title.setStyleSheet(f"font-size:30px;font-weight:700;color:{COLORS['accent']};")
-        subtitle = QLabel("文件上传安全测试与证据化验证工具"); subtitle.setStyleSheet(f"font-size:14px;color:{COLORS['text_secondary']};")
-        version = QLabel(f"当前版本  v{CURRENT_VERSION}"); version.setStyleSheet(f"color:{COLORS['info']};font-weight:600;")
-        hero_l.addWidget(title); hero_l.addWidget(subtitle); hero_l.addWidget(version)
-        grid.addWidget(hero)
+        hero.setStyleSheet(f"""
+            #aboutHero {{
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 {COLORS['bg_secondary']}, stop:1 {COLORS['bg_tertiary']});
+                border: 1px solid {COLORS['border']}; border-radius: 12px;
+            }}
+        """)
+        hero_l = QHBoxLayout(hero); hero_l.setContentsMargins(28, 22, 28, 22)
+        hero_left = QVBoxLayout(); hero_left.setSpacing(6)
+        title = QLabel("UploadRanger")
+        title.setStyleSheet(f"font-size:32px;font-weight:800;color:{COLORS['accent']};background:transparent;")
+        subtitle = QLabel("文件上传安全测试与证据化验证工具")
+        subtitle.setStyleSheet(f"font-size:14px;color:{COLORS['text_secondary']};background:transparent;")
+        hero_left.addWidget(title); hero_left.addWidget(subtitle)
+        hero_l.addLayout(hero_left); hero_l.addStretch()
+        ver_chip = QLabel(f"v{CURRENT_VERSION}")
+        ver_chip.setStyleSheet(f"""
+            font-size:15px;font-weight:800;color:white;background:{COLORS['accent']};
+            border-radius:10px;padding:6px 16px;
+        """)
+        hero_l.addWidget(ver_chip)
+        page.addWidget(hero)
 
-        def card(title_text, body_text, color=None):
-            frame = QFrame(); frame.setStyleSheet(f"QFrame {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']}; border-radius:8px; }}")
-            lay = QVBoxLayout(frame); lay.setContentsMargins(16, 14, 16, 14); lay.setSpacing(6)
-            h = QLabel(title_text); h.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard); h.setStyleSheet(f"font-size:15px;font-weight:600;color:{color or COLORS['text_primary']};")
-            b = QLabel(body_text); b.setWordWrap(True); b.setTextFormat(Qt.TextFormat.RichText); b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextSelectableByKeyboard); b.setStyleSheet(f"font-size:13px;color:{COLORS['text_secondary']};")
-            lay.addWidget(h); lay.addWidget(b); return frame
+        def section(title_text):
+            s = QLabel(title_text)
+            s.setStyleSheet(f"font-size:14px;font-weight:700;color:{COLORS['text_primary']};padding:4px 2px 0 2px;")
+            return s
 
-        grid.addWidget(card("核心能力", "异步上传扫描、原始 multipart 请求解析、文件访问验证、Repeater 重放、Intruder 字典测试、绕过技术与 Polyglot 生成，并支持 MCP stdio/SSE 接入。"))
-        grid.addWidget(card("v1.2.0 处理链路", "抓取请求 → 模板化构造 → Payload 变异 → 上传响应分析 → 同源访问验证 → 证据化结果。未完成验证的响应信号不会直接升级为高危。", COLORS['info']))
-        grid.addWidget(card("浏览器抓包提示", "抓取 localhost/127.0.0.1 时：Chrome/Edge 可使用 <code>--proxy-bypass-list='&lt;-loopback&gt;'</code>；Firefox 检查 <code>network.proxy.allow_hijacking_localhost</code>；代理工具中不要把本地地址加入 bypass 列表。", COLORS['warning']))
+        # ---- 模块操作指南：每个模块"怎么用"一行写清（替代营销式功能矩阵） ----
+        page.addWidget(section("模块操作指南"))
+        ops_card = QFrame()
+        ops_card.setStyleSheet(f"""
+            QFrame {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']};
+                      border-radius:8px; }}
+            QFrame QLabel {{ background:transparent; border:none; }}
+        """)
+        ol = QVBoxLayout(ops_card); ol.setContentsMargins(16, 12, 16, 12); ol.setSpacing(10)
+        ops = [
+            ("扫描", "填目标 URL → 选模式（默认安全测试）→ 开始扫描；结果看「验证状态」列，详情在下方语法高亮面板"),
+            ("代理", "启动代理 → 浏览器代理设为 127.0.0.1:8080 → 抓包列表右键发送到扫描器/Repeater；可配上游代理链入内网"),
+            ("Repeater", "粘贴原始请求 → Send → Raw/Render 查看响应；右键可发送到扫描器做完整验证"),
+            ("Intruder", "请求中用 §…§ 标记测试位置 → 添加 payload 集合 → 选模式与线程 → 开始攻击"),
+            ("Polyglot", "选类型（可自定义底图）→ 填 PHP 探针代码 → 生成 → 保存；绿色徽章=可通过后端内容校验"),
+            ("Magic Bytes", "只修改文件内容开头的签名，适用于「仅查文件头」的校验器；是否真漏洞以访问验证为准"),
+            ("MCP", "AI 助手经 stdio/SSE 接入后可直接调用扫描/取证/验证，见 MCP 页配置说明"),
+        ]
+        for mod, txt in ops:
+            row = QHBoxLayout(); row.setSpacing(12)
+            badge = QLabel(mod)
+            badge.setStyleSheet(f"""
+                font-size:12px;font-weight:700;color:white;background:{COLORS['accent']};
+                border-radius:4px;padding:3px 10px;min-width:64px;qproperty-alignment:AlignCenter;
+            """)
+            row.addWidget(badge)
+            t = QLabel(txt); t.setWordWrap(True)
+            t.setStyleSheet(f"font-size:12px;color:{COLORS['text_primary']};")
+            row.addWidget(t, 1)
+            ol.addLayout(row)
+        page.addWidget(ops_card)
 
-        actions = QHBoxLayout(); actions.addStretch()
-        reset_btn = QPushButton("重置界面"); reset_btn.setToolTip("恢复 Repeater/Intruder 等标签页")
-        reset_btn.clicked.connect(self.reset_tabs); actions.addWidget(reset_btn)
-        author = QLabel("作者：bae  ·  开源项目"); author.setStyleSheet(f"color:{COLORS['text_secondary']};"); actions.addWidget(author); actions.addStretch()
-        grid.addLayout(actions)
-        warning = QLabel("仅用于获得授权的安全测试。请遵守适用法律、合同和测试范围约束。")
-        warning.setWordWrap(True); warning.setAlignment(Qt.AlignmentFlag.AlignCenter); warning.setStyleSheet(f"color:{COLORS['danger']};font-size:12px;")
-        grid.addWidget(warning)
-        grid.addStretch()
+        # ---- 快速上手：三步 ----
+        page.addWidget(section("快速上手"))
+        steps_card = QFrame()
+        steps_card.setStyleSheet(f"""
+            QFrame {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']};
+                      border-left:3px solid {COLORS['success']}; border-radius:8px; }}
+            QFrame QLabel {{ background:transparent; border:none; }}
+        """)
+        sl = QVBoxLayout(steps_card); sl.setContentsMargins(16, 12, 16, 12); sl.setSpacing(8)
+        steps = [
+            ("1", "填写目标 URL（或从代理/Repeater 右键发送上传请求）"),
+            ("2", "选择扫描模式：安全测试默认无害探针；渗透模式需二次确认"),
+            ("3", "开始扫描 → 结果表查看判定层级 → 漏洞表导出证据交付"),
+        ]
+        for num, txt in steps:
+            row = QHBoxLayout()
+            n = QLabel(num)
+            n.setStyleSheet(f"""
+                font-size:12px;font-weight:800;color:white;background:{COLORS['accent']};
+                border-radius:9px;min-width:18px;max-height:18px;padding:1px;qproperty-alignment:AlignCenter;
+            """)
+            row.addWidget(n)
+            t = QLabel(txt); t.setStyleSheet(f"font-size:13px;color:{COLORS['text_primary']};")
+            row.addWidget(t); row.addStretch()
+            sl.addLayout(row)
+        page.addWidget(steps_card)
+
+        # ---- 信息栏：作者/仓库/许可 ----
+        page.addWidget(section("信息"))
+        info_card = QFrame()
+        info_card.setStyleSheet(f"""
+            QFrame {{ background:{COLORS['bg_secondary']}; border:1px solid {COLORS['border']};
+                      border-radius:8px; }}
+            QFrame QLabel {{ background:transparent; border:none; }}
+        """)
+        il = QHBoxLayout(info_card); il.setContentsMargins(16, 12, 16, 12); il.setSpacing(18)
+        for txt in (f"版本 v{CURRENT_VERSION}", "作者 bae", "开源项目 · MIT License", "反馈请提 GitHub Issue"):
+            l = QLabel(txt); l.setStyleSheet(f"font-size:12px;color:{COLORS['text_secondary']};")
+            il.addWidget(l)
+        il.addStretch()
+        gh = QPushButton("GitHub 仓库")
+        gh.setObjectName("success")
+        gh.clicked.connect(lambda: webbrowser.open(GITHUB_REPO_URL))
+        il.addWidget(gh)
+        page.addWidget(info_card)
+
+        # ---- 免责 ----
+        warning = QLabel("⚠ 仅用于获得授权的安全测试。请遵守适用法律、合同和测试范围约束。")
+        warning.setWordWrap(True); warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        warning.setStyleSheet(f"color:{COLORS['danger']};font-size:12px;padding:4px;")
+        page.addWidget(warning)
+        page.addStretch()
+
         scroll.setWidget(content); outer.addWidget(scroll)
         self.tabs.addTab(about_tab, "关于")
     
@@ -2367,6 +2603,17 @@ class MainWindow(QMainWindow):
     
     def _start_scan(self):
         """开始扫描"""
+        # 【修复 P2】在入口先捕获并复位 resume 意图：_resume_scan 置位后本函数
+        # 可能在防重入/无后缀/取消/代理解析失败等多处提前 return，残留会让之后的
+        # 普通「开始扫描」被误当 resume（不清结果、resume_from>0）。
+        was_resume = bool(getattr(self, '_resume_requested', False))
+        self._resume_requested = False
+        # 【修复】防重入检查统一下沉到本入口：向导、发送到扫描器、继续扫描共用同一防护，
+        # 堵住旧 worker 运行中被覆盖成孤儿的双启动问题
+        if getattr(self, 'worker', None) and self.worker.isRunning():
+            self._log("扫描已在进行中，请先停止当前扫描再启动新的扫描")
+            QMessageBox.warning(self, "扫描进行中", "已有扫描任务在运行，请先停止当前扫描再启动新的扫描。")
+            return
         self._scan_finished_handled = False
         url = self.url_input.text().strip()
         
@@ -2388,7 +2635,7 @@ class MainWindow(QMainWindow):
         webshell_config = self._get_webshell_config()
         self._log(f"测试模式: {'渗透测试' if scan_mode == 'penetration' else '安全测试'}")
         if webshell_config.get("enabled"):
-            self._log(f"WebShell配置: 密码={webshell_config['password']}, 类型={webshell_config['type']}")
+            self._log(f"WebShell配置: 密码={_mask_secret(webshell_config['password'])}, 类型={webshell_config['type']}")
         
         # 获取用户选择的后缀
         selected_exts = self._get_selected_extensions()
@@ -2396,38 +2643,62 @@ class MainWindow(QMainWindow):
             self._log("错误: 请至少选择一个测试后缀")
             return
         
-        # 渗透模式下确认上传 EXE/脚本
+        # 【修复】渗透模式确认合并为单一对话框：模式说明 + 目标 URL + 可执行后缀 + 风险提示，
+        # 不再出现"渗透确认 + 可执行文件确认"两次弹窗
         if scan_mode == "penetration":
-            # 检查是否选择了可执行文件后缀
             exec_exts = {'exe', 'dll', 'bat', 'cmd', 'vbs', 'ps1', 'hta', 'scr', 'cpl', 'sh', 'bash', 'elf', 'so'}
             selected_exec = [ext for ext in selected_exts if ext.lstrip('.').lower() in exec_exts]
+            exec_note = ""
             if selected_exec:
-                reply = QMessageBox.question(
-                    self,
-                    "渗透模式 - 确认上传可执行文件",
-                    f"即将上传以下类型的可执行文件：\n• {', '.join(selected_exec)}\n\n"
-                    f"这些文件可能在目标服务器执行，可能触发安全防护或造成系统损害。\n\n是否继续上传可执行文件？",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
+                exec_note = (
+                    f"\n将上传以下类型的可执行文件后缀：{', '.join(selected_exec)}\n"
+                    "这些文件可能在目标服务器执行，可能触发安全防护或造成系统损害。\n"
                 )
-                if reply == QMessageBox.No:
-                    # 用户取消扫描
-                    self._log("[取消] 已取消扫描")
-                    return
-            
+            reply = QMessageBox.question(
+                self,
+                "渗透模式确认",
+                f"即将以【渗透测试模式】扫描目标：\n{url}\n"
+                f"{exec_note}\n"
+                "该模式会上传 WebShell 等攻击载荷（连接密码在日志页已脱敏显示）。\n"
+                "请确认你已获得对目标系统的测试授权。是否继续？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                # 用户取消扫描
+                self._log("[取消] 已取消扫描")
+                return
+        
         self._log(f"测试后缀: {', '.join(selected_exts)}")
         
         # 收集配置
-        proxy = None
+        # 【修复】代理输入统一走 ProxyConfig 规范化（Issue #8 / P0-3）：
+        # 无 scheme 自动补 http://、支持 socks5 与 user:pass 认证，
+        # 非法输入显式报错并阻止开扫，杜绝"用户以为在抓包、实际裸发直连"。
+        self._scan_proxy_config = None
+        proxy_dict = None
         if self.use_proxy_cb.isChecked():
-            proxy = self.proxy_input.text().strip()
-            self._log(f"代理: {proxy}")
-        
-        proxy_dict = {"http://": proxy, "https://": proxy} if proxy else None
+            proxy_text = self.proxy_input.text().strip()
+            if proxy_text:
+                try:
+                    from core.proxy_config import ProxyConfig
+                    pc = ProxyConfig.parse(proxy_text)
+                except ValueError as e:
+                    QMessageBox.warning(
+                        self,
+                        "代理配置错误",
+                        f"代理地址无效：{e}\n\n"
+                        "示例：http://127.0.0.1:8080 或 socks5://user:pass@ip:1080"
+                    )
+                    return
+                self._scan_proxy_config = pc
+                proxy_dict = pc.for_httpx()
+                # 【修复 P1】日志不得带凭据：url 含 user:pass，改用 url_no_auth
+                self._log(f"代理: {pc.url_no_auth}")
         
         headers = {}
         
-        resuming = bool(self._resume_requested and self._scan_resume_index > 0)
+        resuming = bool(was_resume and self._scan_resume_index > 0)
         if not resuming:
             self.results_table.clear_results()
             self.findings_table.clear_results()
@@ -2459,6 +2730,7 @@ class MainWindow(QMainWindow):
             timeout=self.timeout_spin.value(),
             use_raw_multipart=self.use_raw_upload_cb.isChecked(),
             use_fingerprint=self.use_fingerprint_cb.isChecked(),
+            smart_extensions=self.smart_ext_cb.isChecked(),  # 【新增】智能优选（按指纹前置匹配 payload）
             selected_extensions=selected_exts,
             scan_mode=scan_mode,  # 【新增】扫描模式
             webshell_config=webshell_config,  # 【新增】WebShell配置
@@ -2466,8 +2738,13 @@ class MainWindow(QMainWindow):
             custom_payloads=self._custom_payloads,
             strategy_mode=strategy_mode,
             resume_from=self._scan_resume_index if resuming else 0,
+            resume_order_sig=getattr(self, '_scan_resume_order_sig', '') if resuming else '',
+            verify_ssl=not self.verify_ssl_cb.isChecked(),
+            # 【修复 P1】续扫续号：新 engine 的流量 id 从上轮最大 id 续起，
+            # 防止与流量面板里上一轮的行撞号（颜色/跳转/详情联动错位）
+            log_id_base=(max((getattr(l, 'id', 0) for l in self.traffic_viewer.logs), default=0)
+                         if resuming else 0),
         )
-        self._resume_requested = False
         self._pending_request_template = None
         
         self._log("连接工作线程信号...")
@@ -2520,9 +2797,13 @@ class MainWindow(QMainWindow):
         # 正常 finished 信号独占收尾；遗留定时器不能用 None 覆盖真实 ScanResult。
     
     def _stop_scan(self):
-        """停止扫描 - 修复版本，立即响应不等待"""
+        """停止扫描 - 立即响应不等待（协作式停止，worker 后台自然结束）
+
+        【清理】return 之后的旧兜底代码（wait/清引用/恢复 UI）为不可达死代码，
+        已删除——真实收尾统一在 _on_finished。
+        """
         self._log("用户请求停止扫描...")
-        
+
         # 【修复】先禁用停止按钮，防止重复点击
         self.stop_btn.setEnabled(False)
         self._scan_stop_requested = True
@@ -2534,40 +2815,6 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(message)
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-        return
-        
-        try:
-            if hasattr(self, 'worker') and self.worker:
-                if self.worker.isRunning():
-                    self._log("正在停止worker线程...")
-                    self.worker.stop()
-                    
-                    # 【修复】不再等待worker线程，立即返回
-                    # worker会在后台自行结束，不影响UI响应
-                    self._log("已发送停止信号，worker将在后台停止")
-                else:
-                    self._log("Worker线程未在运行状态")
-                
-                # 【修复】立即清理worker引用，不等待
-                self.worker = None
-            else:
-                self._log("没有活动的worker线程")
-                
-        except Exception as e:
-            error_msg = f"停止扫描时出错: {str(e)}"
-            self._log(error_msg)
-            print(f"[MainWindow] {error_msg}")
-            import traceback
-            traceback.print_exc()
-            
-        finally:
-            # 【修复】统一在finally中恢复UI状态，确保无论是否出错都能恢复
-            self._log("恢复UI状态")
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.status_bar.showMessage("扫描已停止")
-            self.progress_bar.setValue(0)
-            self.progress_label.setText("扫描已停止")
 
     def _resume_scan(self):
         """从停止时保存的 Payload 索引继续，保留已有结果和流量。"""
@@ -2624,10 +2871,8 @@ class MainWindow(QMainWindow):
             
             self.progress_label.setText(message)
             self.status_bar.showMessage(message)
-            
-            # 强制UI更新，避免界面冻结
-            from PySide6.QtWidgets import QApplication
-            QApplication.instance().processEvents()
+            # 【修复】本槽由 queued signal 驱动、天然分帧，不再调用 processEvents()——
+            # 递归分发事件会在进度处理期间嵌套执行 _on_finished/按钮点击等其它槽，是重入根源
             
         except Exception as e:
             print(f"进度更新异常: {e}")
@@ -2650,7 +2895,14 @@ class MainWindow(QMainWindow):
         self.stop_btn.setEnabled(False)
         
         # 清理worker引用
+        # 【修复 P2】sender 校验：finished 走 QueuedConnection，旧扫描的 finished
+        # 派发前若再次开扫，这里会把"新 worker"引用误清 → 防重入失效、新扫描无法停止。
+        # 只有 finished 来自当前 worker 才允许清理。
         if self.worker:
+            if self.sender() is not None and self.sender() is not self.worker:
+                self._log("[提示] 收到过期扫描的 finished 信号，忽略（当前扫描仍在进行）")
+                self._scan_finished_handled = False  # 当前扫描结束后仍需正常收尾
+                return
             try:
                 if self.worker.isRunning():
                     self.worker.wait(1000)  # 等待最多1秒
@@ -2682,6 +2934,8 @@ class MainWindow(QMainWindow):
                 planned = getattr(result, 'stats', {}).get('payloads_planned', self._scan_progress_total) if result else self._scan_progress_total
                 skipped = getattr(result, 'stats', {}).get('payloads_skipped', 0) if result else 0
                 self._scan_resume_index = getattr(result, 'stats', {}).get('next_payload_index', 0) if result else 0
+                # 【修复 P1】续扫需带上轮 payload 顺序签名，顺序变化时扫描器回退从头扫
+                self._scan_resume_order_sig = getattr(result, 'stats', {}).get('payloads_order_sig', '') if result else ''
                 message = f"扫描已停止 — 已测试 {tested}/{planned or '?'} 项，跳过 {skipped} 项，已验证 {verified_success} 项"
                 self.status_bar.showMessage(message)
                 self.progress_label.setText(message)
@@ -3059,14 +3313,24 @@ Payload: {finding.payload}
         """生成Polyglot"""
         polyglot_type = self.polyglot_type.currentData()
         php_code = self.polyglot_code.text()
-        
+
+        # 【新增】结构注入型分派：真实底图（自定义或随机）+ PHP 代码注入结构段
+        if polyglot_type in ("struct_png", "struct_jpg"):
+            try:
+                self._generate_struct_polyglot(polyglot_type, php_code)
+            except Exception as e:
+                QMessageBox.warning(self, "生成失败",
+                                    f"结构注入型图片马生成失败:\n{e}\n\n"
+                                    "请确认所选底图为有效 PNG/JPG 图片。")
+            return
+
         polyglots = self.polyglot_generator.get_all_polyglots(php_code)
-        
+
         if polyglot_type in polyglots:
             info = polyglots[polyglot_type]
             self.polyglot_data = info['generator']()
             self.polyglot_ext = info['extension']
-            
+
             # 显示文件类型信息
             is_binary = isinstance(self.polyglot_data, bytes)
             file_type = "二进制" if is_binary else "文本"
@@ -3074,7 +3338,10 @@ Payload: {finding.payload}
                 f"{info['name']}: {info['description']} "
                 f"[{file_type}文件，扩展名: {info['extension']}]"
             )
-            
+
+            # 【新增】图片预览 + 有效性校验徽章：图片马生成器应"所见即所得"
+            self._update_polyglot_image_preview()
+
             if is_binary:
                 hex_preview = self.polyglot_data[:256].hex(' ')
                 formatted = f"# 这是二进制文件的前256字节十六进制预览\n"
@@ -3084,7 +3351,103 @@ Payload: {finding.payload}
                     line = hex_preview[i:i+48]
                     formatted += f"{i:04x}: {line}\n"
                 self.polyglot_preview.setText(formatted)
-    
+
+    def _update_polyglot_image_preview(self):
+        """【新增】生成产物右侧图片预览 + PIL/魔术字节校验状态。"""
+        data = self.polyglot_data
+        if not isinstance(data, bytes) or not data:
+            self.polyglot_image.clear()
+            self.polyglot_image.setText("非二进制产物")
+            return
+        import io
+        from PIL import Image as _PILImage
+        pix = None
+        status = ""
+        color = COLORS['text_secondary']
+        magic_ok = data[:3] in (b"GIF", b"\x89P", b"\xff\xd8\xff") or data[:4] == b"%PDF"
+        try:
+            img = _PILImage.open(io.BytesIO(data))
+            img.verify()
+            # verify 后重新打开取帧渲染
+            img2 = _PILImage.open(io.BytesIO(data))
+            img2.thumbnail((220, 220))
+            import io as _io2
+            buf = _io2.BytesIO()
+            img2.save(buf, "PNG")
+            from PySide6.QtGui import QPixmap
+            pix = QPixmap()
+            pix.loadFromData(buf.getvalue(), "PNG")
+            status = "✓ 完整图片结构（魔术字节 + PIL 校验通过，可过 getimagesize 类内容校验）"
+            color = COLORS['success']
+        except Exception:
+            if magic_ok:
+                status = "△ 仅魔术字节前缀（非完整图片，只对'只查文件头'的校验器有效）"
+                color = COLORS['warning']
+            else:
+                status = "△ 文本/其他产物（无图片结构）"
+        if pix and not pix.isNull():
+            self.polyglot_image.setPixmap(pix)
+        else:
+            self.polyglot_image.clear()
+            self.polyglot_image.setText("无预览")
+        self.polyglot_validate.setText(status)
+        self.polyglot_validate.setStyleSheet(f"color: {color}; font-weight: 600; padding: 2px 4px;")
+
+    def _pick_custom_image(self):
+        """【新增】选择自定义底图（PNG/JPG）"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择底图图片", "", "图片 (*.png *.jpg *.jpeg);;所有文件 (*.*)")
+        if path:
+            self._custom_image_path = path
+            self.custom_image_btn.setText("✓ " + os.path.basename(path)[:28])
+            self.custom_image_btn.setToolTip(path)
+
+    def _generate_struct_polyglot(self, kind: str, php_code: str):
+        """【新增】结构注入型图片马：真实底图（自定义/随机）+ PHP 注入 tEXt/COM 段。
+
+        与简化"签名+文本"不同，产物为结构完整的图片，可通过
+        getimagesize/exif_imagetype 类后端内容校验（在线靶场实测）。
+        """
+        import io, random
+        from PIL import Image as _PILImage
+        from payloads.polyglot_builder import PolyglotBuilder
+
+        custom = getattr(self, "_custom_image_path", "")
+        if custom and os.path.exists(custom):
+            source = custom
+        else:
+            buf = io.BytesIO()
+            img = _PILImage.new('RGB', (64, 64),
+                                (random.randint(150, 255), random.randint(150, 255), random.randint(150, 255)))
+            img.save(buf, 'PNG')
+            source = buf.getvalue()
+
+        pb = PolyglotBuilder()
+        if kind == "struct_png":
+            self.polyglot_data = pb.create_png_text_php(source, php_code)
+            self.polyglot_ext = ".png.php"
+            type_name = "PNG结构注入型图片马"
+        else:
+            self.polyglot_data = pb.create_jpeg_com_php(source, php_code)
+            self.polyglot_ext = ".jpg.php"
+            type_name = "JPEG COM注入型图片马"
+
+        self.polyglot_info.setText(
+            f"{type_name} [二进制文件，扩展名: {self.polyglot_ext}]"
+            + (f"  底图: {os.path.basename(custom)}" if custom and os.path.exists(custom) else "  底图: 内置随机")
+        )
+        self._update_polyglot_image_preview()
+
+        if isinstance(self.polyglot_data, bytes):
+            hex_preview = self.polyglot_data[:256].hex(' ')
+            formatted = f"# 这是二进制文件的前256字节十六进制预览\n"
+            formatted += f"# 文件类型: {type_name}\n"
+            formatted += f"# 完整大小: {len(self.polyglot_data)} 字节\n\n"
+            for i in range(0, len(hex_preview), 48):
+                line = hex_preview[i:i+48]
+                formatted += f"{i:04x}: {line}\n"
+            self.polyglot_preview.setText(formatted)
+
     def _save_polyglot(self):
         """保存Polyglot"""
         if self.polyglot_data is None:

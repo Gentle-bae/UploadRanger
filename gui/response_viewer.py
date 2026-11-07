@@ -14,9 +14,9 @@ except Exception:
     CHARDET_AVAILABLE = False
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QTabWidget, QPlainTextEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPlainTextEdit,
     QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QApplication,
-    QStyledItemDelegate, QProxyStyle, QStyle, QScrollArea
+    QCheckBox, QStyledItemDelegate, QProxyStyle, QStyle, QScrollArea
 )
 from PySide6.QtGui import QFont, QKeySequence, QPixmap
 from PySide6.QtCore import Qt, QUrl, QUrlQuery
@@ -82,7 +82,7 @@ class ResponseViewerWidget(QWidget):
         super().__init__(parent)
         self._init_ui()
         self._max_bytes = 10_000_000  # 保留完整常规响应，同时避免超大响应拖垮 GUI
-        self._max_hex_bytes = 256_000
+        self._max_hex_bytes = 65_536  # 【修复】Hex 视图上限 64KB（原 256KB 生成 16000 行会卡死主线程）
         # 用于 WebEngineView 刷新时存储待渲染内容
         self._pending_html: str = ""
         self._pending_url = QUrl("about:blank")
@@ -106,7 +106,8 @@ class ResponseViewerWidget(QWidget):
 
         if CHARDET_AVAILABLE and chardet is not None:
             try:
-                detected = chardet.detect(body_bytes)
+                # 【修复】只采样前 64KB 做编码探测：chardet 全量分析 10MB 会在主线程冻结数秒
+                detected = chardet.detect(body_bytes[:65536])
                 if detected and detected.get('encoding'):
                     enc = detected['encoding']
                     conf = detected.get('confidence', 0)
@@ -182,32 +183,30 @@ class ResponseViewerWidget(QWidget):
         self._pretty_hl = HTTPHighlighter(self.pretty_view.document(), is_request=False)
         self.tabs.addTab(self.pretty_view, "Pretty")
 
-        if WEBENGINE_AVAILABLE and QWebEngineView is not None and QWebEnginePage is not None:
-            try:
-                self.render_view = QWebEngineView()
-                self.render_view.setPage(_SilentWebPage(self.render_view))
-                self._secure_webengine(self.render_view)
-                profile = self.render_view.page().profile()
-                if QWebEngineProfile is not None:
-                    profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.NoCache)
-                    profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
-                # 【修复】WebEngineView 背景设为与工具主题一致的深色背景
-                # 这样原始网页如果有自己的暗色背景可以正确显示
-                self.render_view.setStyleSheet(f"QWebEngineView {{ background-color: {COLORS['bg_primary']}; }}")
-                self.tabs.addTab(self.render_view, "Render")
-            except Exception:
-                self.render_view = None
-                self.render_placeholder = QLabel("WebEngine unavailable")
-                self.render_placeholder.setAlignment(Qt.AlignCenter)
-                self.render_placeholder.setStyleSheet(f"""
-                    QLabel {{
-                        background-color: {COLORS['bg_secondary']};
-                        color: {COLORS['text_secondary']};
-                        padding: 20px;
-                    }}
-                """)
-                self.tabs.addTab(self.render_placeholder, "Render")
-        else:
+        # 【修复 P0】Render 视图惰性创建：WebEngine 初始化(GPU/子进程)是启动
+        # 阶段的重量级操作，实测在部分机器上直接拖慢甚至冻结"打开应用"，
+        # 且每次 new ResponseViewerWidget 都要付一次代价。改为首次切到
+        # Render 标签时才真正创建；此前的 set_response 存 pending，创建后自动渲染。
+        self._render_lazy_created = False
+        _render_host = QWidget()
+        _render_host_lay = QVBoxLayout(_render_host)
+        _render_host_lay.setContentsMargins(0, 0, 0, 0)
+        self._render_host_label = QLabel("Render 视图将在首次切换到此标签时加载")
+        self._render_host_label.setAlignment(Qt.AlignCenter)
+        self._render_host_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {COLORS['bg_secondary']};
+                color: {COLORS['text_secondary']};
+                padding: 20px;
+            }}
+        """)
+        _render_host_lay.addWidget(self._render_host_label)
+        self._render_host = _render_host
+        self.render_view = None
+        self.render_placeholder = None
+        self.tabs.addTab(_render_host, "Render")
+
+        if not (WEBENGINE_AVAILABLE and QWebEngineView is not None and QWebEnginePage is not None):
             self.render_view = None
             self.render_placeholder = QLabel("WebEngine unavailable")
             self.render_placeholder.setAlignment(Qt.AlignCenter)
@@ -218,7 +217,11 @@ class ResponseViewerWidget(QWidget):
                     padding: 20px;
                 }}
             """)
-            self.tabs.addTab(self.render_placeholder, "Render")
+            self._render_host_lay.replaceWidget(self._render_host_label, self.render_placeholder)
+            self._render_host_label.hide()
+
+        # 切到 Render 标签时惰性创建 WebEngine（首次才会付初始化代价）
+        self.tabs.currentChanged.connect(self._on_render_tab_activated)
 
         # ========== Image 视图 ==========
         # 【隐藏】Image 标签对于文件上传测试通常无用，暂不显示
@@ -272,17 +275,83 @@ class ResponseViewerWidget(QWidget):
         """)
         self.tabs.addTab(self.hex_table, "Hex")
 
+    def _ensure_render_view(self):
+        """首次切到 Render 标签时才创建 WebEngine 视图（启动零开销）。
+
+        【修复 P0】WebEngine 初始化(GPU/子进程)是启动阶段重量级操作，实测在
+        部分机器上直接拖慢甚至冻结"打开应用"。惰性化后启动完全不碰 WebEngine。
+        """
+        if getattr(self, "_render_lazy_created", False):
+            return
+        self._render_lazy_created = True
+        try:
+            if not (WEBENGINE_AVAILABLE and QWebEngineView is not None and QWebEnginePage is not None):
+                return
+            self.render_view = QWebEngineView()
+            self.render_view.setPage(_SilentWebPage(self.render_view))
+            self._secure_webengine(self.render_view)
+            profile = self.render_view.page().profile()
+            if QWebEngineProfile is not None:
+                profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.NoCache)
+                profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+            self.render_view.setStyleSheet(f"QWebEngineView {{ background-color: {COLORS['bg_primary']}; }}")
+
+            render_toolbar = QHBoxLayout()
+            render_toolbar.setContentsMargins(4, 2, 4, 2)
+            self.render_js_cb = QCheckBox("启用 JS")
+            self.render_js_cb.setChecked(False)
+            self.render_js_cb.setToolTip("默认不执行响应中的 JavaScript；勾选后需重新渲染才生效")
+            self.render_base_cb = QCheckBox("以目标地址渲染相对资源")
+            self.render_base_cb.setChecked(False)
+            self.render_base_cb.setToolTip(
+                "默认以 about:blank 渲染；勾选后相对资源按目标 URL 解析（会向目标发起额外请求）"
+            )
+            for cb in (self.render_js_cb, self.render_base_cb):
+                cb.setStyleSheet(f"color: {COLORS['text_secondary']};")
+                render_toolbar.addWidget(cb)
+            render_toolbar.addStretch()
+
+            render_layout = QVBoxLayout()
+            render_layout.setContentsMargins(0, 0, 0, 0)
+            render_layout.setSpacing(0)
+            render_layout.addLayout(render_toolbar)
+            render_layout.addWidget(self.render_view)
+            self._render_host_lay.addLayout(render_layout)
+            self._render_host_label.hide()
+            # 已有 pending 内容则立即渲染一次
+            if getattr(self, "_pending_html", ""):
+                self._update_render_view()
+        except Exception:
+            self.render_view = None
+
+    def _on_render_tab_activated(self, index: int):
+        if self.tabs.tabText(index) == "Render":
+            self._ensure_render_view()
+
     def _secure_webengine(self, view: QWebEngineView):
         if view is None:
             return
         settings = view.settings()
-        # 【修复】启用 JavaScript 以支持现代网页的 CSS 样式（包括暗色主题）
-        # 由于 setHtml() 加载的是内联 HTML，安全性不受影响
-        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        # 【修复】JavaScript 默认关闭：setHtml() 加载的内联 HTML 同样会执行脚本，
+        # 渲染的是渗透工具收到的不可信响应，存在反射 XSS 落地面；如需 JS 由 Render
+        # 工具栏的「启用 JS」开关显式打开（勾选后重新渲染才生效）
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, False)
         settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False)
         settings.setDefaultTextEncoding("UTF-8")
+
+    def _apply_render_settings(self):
+        """按 Render 工具栏开关应用 JS 设置（勾选变化后需重新渲染才生效）。"""
+        if not (WEBENGINE_AVAILABLE and self.render_view and QWebEngineSettings is not None):
+            return
+        try:
+            js_enabled = bool(getattr(self, 'render_js_cb', None) and self.render_js_cb.isChecked())
+            self.render_view.settings().setAttribute(
+                QWebEngineSettings.WebAttribute.JavascriptEnabled, js_enabled
+            )
+        except Exception:
+            pass
 
     def _is_binary_content(self, content_type: str, body_bytes: bytes) -> bool:
         if content_type:
@@ -327,18 +396,27 @@ class ResponseViewerWidget(QWidget):
 
         body_text, detected_encoding = self._detect_encoding(display_bytes, content_type)
 
+        # 【性能】Raw/Pretty 文本视图加 1MB 显示上限：QPlainTextEdit.setPlainText 对 5MB 文本
+        # 单次约 1s，raw+pretty 两视图会把主线程卡 2s+（分段实测）。完整内容仍保留在
+        # TrafficLog / response_body_bytes 中，此处仅裁剪"显示层"。
+        def _cap_display(text: str) -> str:
+            limit = 1_000_000
+            if len(text) <= limit:
+                return text
+            return (text[:limit]
+                    + f"\n\n[已截断：仅显示前 1MB / 共 {len(text)} 字符，完整内容见流量记录]")
+
         if is_binary:
             note = f"[binary content - {len(body_bytes)} bytes - {detected_encoding}]"
             if truncated:
                 note += f"\n[truncated to {self._max_bytes} bytes for display]"
             full_raw = f"{headers_text}\n\n{note}"
         else:
-            full_raw = f"{headers_text}\n\n{body_text}"
+            full_raw = f"{headers_text}\n\n{_cap_display(body_text)}"
 
         self.raw_view.setPlainText(full_raw)
-        # 【新增】强制重新应用语法高亮
-        if hasattr(self, '_raw_hl') and self._raw_hl:
-            self._raw_hl.rehighlight()
+        # 【修复】删除冗余 rehighlight()：QSyntaxHighlighter 会在 setPlainText 后增量高亮，
+        # 全量 rehighlight 等于把大文本再扫一遍，纯浪费主线程时间
 
         if not is_binary:
             try:
@@ -347,16 +425,18 @@ class ResponseViewerWidget(QWidget):
                 pretty = body_text
             if truncated:
                 pretty = f"[truncated to {self._max_bytes} bytes for display]\n\n{pretty}"
-            self.pretty_view.setPlainText(pretty)
-            # 【新增】强制重新应用语法高亮
-            if hasattr(self, '_pretty_hl') and self._pretty_hl:
-                self._pretty_hl.rehighlight()
+            self.pretty_view.setPlainText(_cap_display(pretty))
+            # 【修复】同上，Pretty 视图的 rehighlight() 一并删除
         else:
             self.pretty_view.setPlainText("[binary content]")
 
+        if WEBENGINE_AVAILABLE and not truncated:
+            self._ensure_render_view()
         if WEBENGINE_AVAILABLE and self.render_view and not truncated:
             try:
                 self.render_view.stop()
+                # 按工具栏开关应用 JS 设置（默认关闭，勾选后重新渲染才生效）
+                self._apply_render_settings()
                 # 【修复】更宽泛的HTML检测 - 检查Content-Type或HTML标签特征
                 is_html_content = (
                     "html" in content_type.lower() or 
@@ -371,8 +451,15 @@ class ResponseViewerWidget(QWidget):
                     is_html_content = any(tag in body_lower for tag in html_tags)
                 
                 if is_html_content and not is_binary:
+                    # 【修复 P2】Render 输入同样封顶：QWebEngine setHtml 有约 2MB 的
+                    # 已知上限，超过会白屏；且原文 bytes + pending str 双驻留内存。
+                    # 统一按 1MB 上限截断并在页内注明。
+                    render_text = body_text
+                    if len(render_text) > 1_000_000:
+                        render_text = (render_text[:1_000_000]
+                                       + f"\n<!-- [已截断：仅渲染前 1MB / 共 {len(body_text)} 字符] -->")
                     # 确保HTML有基础结构（不覆盖原始样式）
-                    html_to_render = self._ensure_html_structure(body_text)
+                    html_to_render = self._ensure_html_structure(render_text)
                     url = self._render_base_url(base_url)
                     # 【修复】使用 update() 强制刷新，并存储待渲染内容用于手动刷新
                     self._pending_html = html_to_render
@@ -397,12 +484,14 @@ class ResponseViewerWidget(QWidget):
         elif body_text and not is_binary:
             html_tags = ['<html', '<body', '<div', '<script', '<style', '<head', '<p>', '<a ', '<img', '<form']
             if any(tag in body_text[:1000].lower() for tag in html_tags):
-                self._pending_html = self._ensure_html_structure(body_text)
+                _rt = body_text if len(body_text) <= 1_000_000 else body_text[:1_000_000]
+                self._pending_html = self._ensure_html_structure(_rt)
                 self._pending_url = self._render_base_url(base_url)
 
         hex_bytes = display_bytes[: self._max_hex_bytes]
+        hex_truncated = len(display_bytes) > self._max_hex_bytes
         rows = self._generate_hex_rows(hex_bytes)
-        self._fill_hex_table(rows, truncated=(len(display_bytes) > self._max_hex_bytes))
+        self._fill_hex_table(rows, truncated=hex_truncated, total_size=len(display_bytes))
 
         # ========== 设置 Image 视图 ==========
         self._load_image(display_bytes, content_type, truncated)
@@ -455,8 +544,11 @@ class ResponseViewerWidget(QWidget):
         self.set_response(headers_text, body_bytes, content_type, base_url=url)
 
     def _render_base_url(self, base_url: str | None) -> QUrl:
-        """每次渲染使用不同 base URL，避免 WebEngine 复用上一份文档/资源缓存。"""
-        url = QUrl(base_url) if base_url else QUrl("about:blank")
+        """【修复】默认以 about:blank 渲染，不向目标源发起未发起的相对资源请求；
+        仅当用户勾选「以目标地址渲染相对资源」时才使用目标 URL（附加代次参数避免缓存）。"""
+        if not (getattr(self, 'render_base_cb', None) and self.render_base_cb.isChecked() and base_url):
+            return QUrl("about:blank")
+        url = QUrl(base_url)
         if url.isValid() and url.scheme() in ("http", "https"):
             query = QUrlQuery(url)
             query.addQueryItem("__uploadranger_render", str(self._render_generation))
@@ -466,25 +558,10 @@ class ResponseViewerWidget(QWidget):
     @staticmethod
     def _build_render_info_page(base_url: str | None, content_type: str, size: int, is_binary: bool) -> str:
         kind = "二进制文件" if is_binary else "非 HTML 响应"
-        url = escape(base_url or "about:blank")
-        ctype = escape(content_type or "unknown")
         return f"""<!doctype html><html><head><meta charset='utf-8'>
         <meta http-equiv='Cache-Control' content='no-store'>
         <style>body{{font-family:Segoe UI,Arial,sans-serif;background:#202133;color:#eee;padding:24px}}
-        .card{{max-width:760px;border:1px solid #4b4769;border-radius:8px;padding:18px;background:#292a3d}}
-        code{{color:#9b70ff;word-break:break-all}}</style></head><body><div class='card'>
-        <h3>最终响应为{kind}</h3><p>Render 不会把该内容作为 HTML 执行，因此不会再显示白页。</p>
-        <p>URL：<code>{url}</code></p><p>Content-Type：<code>{ctype}</code></p>
-        <p>大小：<code>{size}</code> bytes</p><p>请在 Raw / Hex 查看原始内容。</p>
-        </div></body></html>"""
-
-    @staticmethod
-    def _build_render_info_page(base_url: str | None, content_type: str, size: int, is_binary: bool) -> str:
-        kind = "二进制文件" if is_binary else "非 HTML 响应"
-        return f"""<!doctype html><html><head><meta charset='utf-8'>
-        <meta http-equiv='Cache-Control' content='no-store'>
-        <style>body{{font-family:Segoe UI,Arial,sans-serif;background:#202133;color:#eee;padding:24px}}
-        .card{{max-width:760px;border:1px solid #4b4769;border-radius:8px;padding:18px;background:#292a3d}}
+        .card{{max-width:760px;border:1px solid #4b4769;border-radius:8px;padding:18px;background:#261840}}
         code{{color:#9b70ff;word-break:break-all}}</style></head><body><div class='card'>
         <h3>最终响应为{kind}</h3><p>Render 不会把该内容作为 HTML 执行，因此不会再显示白页。</p>
         <p>URL：<code>{escape(base_url or 'about:blank')}</code></p>
@@ -594,7 +671,7 @@ class ResponseViewerWidget(QWidget):
             rows.append((offset, hex_str, ascii_str))
         return rows
 
-    def _fill_hex_table(self, rows, truncated: bool):
+    def _fill_hex_table(self, rows, truncated: bool, total_size: int = 0):
         self.hex_table.setRowCount(0)
         for offset, hex_str, ascii_str in rows:
             row = self.hex_table.rowCount()
@@ -607,7 +684,11 @@ class ResponseViewerWidget(QWidget):
             row = self.hex_table.rowCount()
             self.hex_table.insertRow(row)
             self.hex_table.setItem(row, 0, QTableWidgetItem(""))
-            self.hex_table.setItem(row, 1, QTableWidgetItem(f"[truncated to {self._max_hex_bytes} bytes for display]"))
+            total_note = f" / 共 {total_size} 字节" if total_size else ""
+            self.hex_table.setItem(
+                row, 1,
+                QTableWidgetItem(f"[已截断：仅显示前 {self._max_hex_bytes // 1024}KB{total_note}]")
+            )
             self.hex_table.setItem(row, 2, QTableWidgetItem(""))
 
     def _ensure_html_structure(self, html: str) -> str:
@@ -723,13 +804,17 @@ class ResponseViewerWidget(QWidget):
                 self.image_label.setStyleSheet("color: #f0ad4e; padding: 20px; background-color: #2d2d2d;")
             else:
                 self.image_label.setText("非图片响应")
-                self.image_label.setStyleSheet("color: #888; background-color: #2d2d2d;")
+                self.image_label.setStyleSheet("color: #b0a4cc; background-color: #2d2d2d;")
 
             self.image_label.setPixmap(QPixmap())
 
     def clear(self):
         self._render_generation += 1
         """【修复】安全清空所有视图，避免程序退出时卡住"""
+        # 【修复 P3】清空待渲染内容：否则清空后切到 Render（切 tab 触发
+        # _update_render_view）会把上一条响应 setHtml 复活
+        self._pending_html = ""
+        self._pending_url = None
         self.raw_view.clear()
         self.pretty_view.clear()
         

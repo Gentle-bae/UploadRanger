@@ -68,3 +68,8 @@ config.local.py
 
 # 开发文档（不上传）
 #UPGRADE_PROGRESS_v2.md
+
+# 内部审�文档（伉
+audit-2026-11-05/
+notes.md
+.mcp-ssh.lock

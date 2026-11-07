@@ -3,7 +3,7 @@
 """
 UploadRanger - 文件上传漏洞测试工具
 作者: bae
-版本: v1.2.0
+版本: v1.3.0
 """
 
 import sys
@@ -14,9 +14,17 @@ import argparse
 if sys.platform.startswith("win"):
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gentle-bae.UploadRanger.1.2.0")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Gentle-bae.UploadRanger.1.3.0")
     except Exception:
         pass
+    # 【修复】Windows 下禁用 QtWebEngine GPU 合成：实测在部分机器（D3D/DXGI
+    # 驱动差异）上，点击扫描结果触发 Render 视图 setHtml 会冻结甚至崩退
+    # （进程直接退出）。WebEngine 在本工具里只做只读展示，软件渲染足够。
+    os.environ.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--disable-gpu --disable-gpu-compositing --no-sandbox",
+    )
+    os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
